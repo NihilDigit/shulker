@@ -523,6 +523,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sysinfo",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

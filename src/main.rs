@@ -10,7 +10,10 @@ use std::{
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -31,8 +34,65 @@ use serde::{Deserialize, Serialize};
 #[command(name = "mc-tui", about, version)]
 struct Cli {
     /// Path to the Minecraft server directory (must contain server.properties).
-    #[arg(short = 'd', long, env = "MC_SERVER_DIR")]
-    server_dir: PathBuf,
+    /// If omitted, falls back to the value remembered in $XDG_CONFIG_HOME/mc-tui/state.toml.
+    #[arg(short = 'd', long, env = "MC_SERVER_DIR", global = true)]
+    server_dir: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Cmd {
+    /// Run the TUI (default if omitted).
+    Run,
+    /// Scaffold a new server directory: pick MC version + Paper/Purpur, download jar, write start.sh.
+    New {
+        /// Target directory.
+        dir: PathBuf,
+        /// Allow scaffolding into a non-empty directory.
+        #[arg(long)]
+        force: bool,
+        /// MC version (e.g. 1.21.4). Defaults to latest.
+        #[arg(long)]
+        mc_version: Option<String>,
+        /// Server type: paper or purpur. Defaults to purpur.
+        #[arg(long, value_enum, default_value_t = ServerType::Purpur)]
+        server_type: ServerType,
+        /// Run server once after scaffolding to generate server.properties, then stop.
+        #[arg(long)]
+        first_boot: bool,
+    },
+    /// Render one TUI frame to stdout as text (used for screenshot QA).
+    Screenshot {
+        /// Tab to render: worlds | whitelist | ops | config | logs | backups | rcon | yaml | ops-panel.
+        #[arg(long, default_value = "worlds")]
+        tab: String,
+        /// Width in cells.
+        #[arg(long, default_value_t = 100)]
+        width: u16,
+        /// Height in cells.
+        #[arg(long, default_value_t = 30)]
+        height: u16,
+        /// Language: en or zh.
+        #[arg(long, default_value = "en")]
+        lang: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum ServerType {
+    Paper,
+    Purpur,
+}
+
+impl ServerType {
+    fn name(self) -> &'static str {
+        match self {
+            ServerType::Paper => "paper",
+            ServerType::Purpur => "purpur",
+        }
+    }
 }
 
 // ---------- Data layer ----------
@@ -230,6 +290,500 @@ fn server_running_pid(server_dir: &Path) -> Option<u32> {
     None
 }
 
+// ---------- i18n ----------
+//
+// All user-facing strings live here. UI / status code refers to them as
+// `app.lang.s().<field>` (static) or `fmt_<event>(lang, ...)` (parametric).
+// New strings: add to `Strings` + populate `EN` and `ZH`.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Lang {
+    #[default]
+    En,
+    Zh,
+}
+
+impl Lang {
+    fn code(self) -> &'static str {
+        match self {
+            Lang::En => "en",
+            Lang::Zh => "zh",
+        }
+    }
+    fn from_code(s: &str) -> Lang {
+        match s {
+            "zh" | "zh-CN" | "cn" => Lang::Zh,
+            _ => Lang::En,
+        }
+    }
+    fn toggle(self) -> Lang {
+        match self {
+            Lang::En => Lang::Zh,
+            Lang::Zh => Lang::En,
+        }
+    }
+    fn s(self) -> &'static Strings {
+        match self {
+            Lang::En => &EN,
+            Lang::Zh => &ZH,
+        }
+    }
+}
+
+#[allow(dead_code)] // some fields populated for future tabs (backups/rcon/yaml)
+struct Strings {
+    // Status bar
+    server_label: &'static str,
+    level_label: &'static str,
+    dir_label: &'static str,
+    status_stopped: &'static str,
+    // Tab names
+    tab_worlds: &'static str,
+    tab_whitelist: &'static str,
+    tab_ops: &'static str,
+    tab_config: &'static str,
+    tab_logs: &'static str,
+    tab_backups: &'static str,
+    tab_rcon: &'static str,
+    tab_ops_panel: &'static str,
+    // Pane titles
+    title_worlds: &'static str,
+    title_whitelist: &'static str,
+    title_ops: &'static str,
+    title_config: &'static str,
+    title_logs_prefix: &'static str, // prefix; full title = `<prefix><path> `
+    // Hints
+    hint_worlds: &'static str,
+    hint_whitelist: &'static str,
+    hint_ops: &'static str,
+    hint_config: &'static str,
+    hint_logs: &'static str,
+    // Prompt chrome
+    prompt_confirm_cancel: &'static str,
+    prompt_label_player: &'static str,
+    prompt_label_world: &'static str,
+    prompt_label_value: &'static str,
+    prompt_label_path: &'static str,
+    prompt_title_add_whitelist: &'static str,
+    prompt_title_op_player: &'static str,
+    prompt_title_new_world: &'static str,
+    prompt_title_change_dir: &'static str,
+    // Static status / errors
+    ready: &'static str,
+    refreshed: &'static str,
+    cancelled: &'static str,
+    err_already_running: &'static str,
+    err_not_running: &'static str,
+    err_stop_first: &'static str,
+    err_already_current_world: &'static str,
+    no_logs_yet: &'static str,
+    spawn_started: &'static str,
+    // Detail-panel headers (used by hover-detail feature)
+    detail_header: &'static str,
+    detail_default: &'static str,
+    detail_range: &'static str,
+    detail_no_info: &'static str,
+}
+
+const EN: Strings = Strings {
+    server_label: "server: ",
+    level_label: "level: ",
+    dir_label: "dir: ",
+    status_stopped: "○ stopped",
+    tab_worlds: "Worlds",
+    tab_whitelist: "Whitelist",
+    tab_ops: "Ops",
+    tab_config: "Config",
+    tab_logs: "Logs",
+    tab_backups: "Backups",
+    tab_rcon: "RCON",
+    tab_ops_panel: "Server",
+    title_worlds: " Worlds (●=current) ",
+    title_whitelist: " Whitelist ",
+    title_ops: " Operators (←/→ change level) ",
+    title_config: " server.properties (Enter = edit) ",
+    title_logs_prefix: " Logs — tail of ",
+    hint_worlds: "↑/↓ select   Enter switch   N new   S start   X stop   D dir   L lang   r refresh   q quit",
+    hint_whitelist: "↑/↓ select   a add   d remove   S start   X stop   D dir   L lang   r refresh   q quit",
+    hint_ops: "↑/↓ select   a add   d remove   ←/→ level   S start   X stop   D dir   L lang   q quit",
+    hint_config: "↑/↓ select   Enter edit   S start   X stop   D dir   L lang   r refresh   q quit",
+    hint_logs: "S start   X stop   D dir   L lang   r refresh   Tab/1-9 tabs   q quit",
+    prompt_confirm_cancel: "Enter = confirm    Esc = cancel",
+    prompt_label_player: "player name",
+    prompt_label_world: "world name",
+    prompt_label_value: "value",
+    prompt_label_path: "path",
+    prompt_title_add_whitelist: "Add to whitelist",
+    prompt_title_op_player: "Op a player",
+    prompt_title_new_world: "Create new world",
+    prompt_title_change_dir: "Switch server-dir",
+    ready: "Ready.",
+    refreshed: "Refreshed.",
+    cancelled: "Cancelled.",
+    err_already_running: "✗ Server already running.",
+    err_not_running: "✗ Server not running.",
+    err_stop_first: "✗ Stop the server first (it's running).",
+    err_already_current_world: "→ Already current world.",
+    no_logs_yet: "(no logs yet)",
+    spawn_started: "→ Spawned start.sh (detached). Waiting for pid…",
+    detail_header: "Details",
+    detail_default: "Default",
+    detail_range: "Range",
+    detail_no_info: "(no extra info)",
+};
+
+const ZH: Strings = Strings {
+    server_label: "服务器: ",
+    level_label: "世界: ",
+    dir_label: "目录: ",
+    status_stopped: "○ 已停止",
+    tab_worlds: "世界",
+    tab_whitelist: "白名单",
+    tab_ops: "管理员",
+    tab_config: "配置",
+    tab_logs: "日志",
+    tab_backups: "备份",
+    tab_rcon: "RCON",
+    tab_ops_panel: "运维",
+    title_worlds: " 世界 (●=当前) ",
+    title_whitelist: " 白名单 ",
+    title_ops: " 管理员 (←/→ 调整级别) ",
+    title_config: " server.properties (Enter 编辑) ",
+    title_logs_prefix: " 日志 — 末尾来自 ",
+    hint_worlds: "↑/↓ 选择   Enter 切换   N 新建   S 启动   X 停止   D 切换目录   L 语言   r 刷新   q 退出",
+    hint_whitelist: "↑/↓ 选择   a 添加   d 移除   S 启动   X 停止   D 切换目录   L 语言   r 刷新   q 退出",
+    hint_ops: "↑/↓ 选择   a 添加   d 移除   ←/→ 级别   S 启动   X 停止   D 切换目录   L 语言   q 退出",
+    hint_config: "↑/↓ 选择   Enter 编辑   S 启动   X 停止   D 切换目录   L 语言   r 刷新   q 退出",
+    hint_logs: "S 启动   X 停止   D 切换目录   L 语言   r 刷新   Tab/1-9 切换   q 退出",
+    prompt_confirm_cancel: "Enter 确认    Esc 取消",
+    prompt_label_player: "玩家名",
+    prompt_label_world: "世界名",
+    prompt_label_value: "值",
+    prompt_label_path: "路径",
+    prompt_title_add_whitelist: "加入白名单",
+    prompt_title_op_player: "提升为 OP",
+    prompt_title_new_world: "创建新世界",
+    prompt_title_change_dir: "切换 server-dir",
+    ready: "就绪。",
+    refreshed: "已刷新。",
+    cancelled: "已取消。",
+    err_already_running: "✗ 服务器已在运行。",
+    err_not_running: "✗ 服务器未运行。",
+    err_stop_first: "✗ 请先停止运行中的服务器。",
+    err_already_current_world: "→ 已是当前世界。",
+    no_logs_yet: "(暂无日志)",
+    spawn_started: "→ 已分离启动 start.sh，等待 pid 出现…",
+    detail_header: "详情",
+    detail_default: "默认",
+    detail_range: "取值",
+    detail_no_info: "(暂无说明)",
+};
+
+// Parametric messages — return owned Strings.
+
+fn tab_name(lang: Lang, id: TabId) -> &'static str {
+    let s = lang.s();
+    match id {
+        TabId::Worlds => s.tab_worlds,
+        TabId::Whitelist => s.tab_whitelist,
+        TabId::Ops => s.tab_ops,
+        TabId::Config => s.tab_config,
+        TabId::Logs => s.tab_logs,
+    }
+}
+
+fn hint_for(lang: Lang, id: TabId) -> &'static str {
+    let s = lang.s();
+    match id {
+        TabId::Worlds => s.hint_worlds,
+        TabId::Whitelist => s.hint_whitelist,
+        TabId::Ops => s.hint_ops,
+        TabId::Config => s.hint_config,
+        TabId::Logs => s.hint_logs,
+    }
+}
+
+fn fmt_status_running(lang: Lang, pid: u32) -> String {
+    match lang {
+        Lang::En => format!("● running (pid {})", pid),
+        Lang::Zh => format!("● 运行中 (pid {})", pid),
+    }
+}
+fn fmt_world_switched(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✓ Switched to '{}'. Restart the server to load it.", name),
+        Lang::Zh => format!("✓ 已切换到 '{}'。请重启服务器以加载。", name),
+    }
+}
+fn fmt_world_created(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✓ level-name='{}'. Next start will generate the world.", name),
+        Lang::Zh => format!("✓ level-name='{}'。下次启动将生成该世界。", name),
+    }
+}
+fn fmt_world_invalid(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✗ Invalid world name: '{}'.", name),
+        Lang::Zh => format!("✗ 非法世界名: '{}'。", name),
+    }
+}
+fn fmt_world_exists(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✗ '{}' already exists.", name),
+        Lang::Zh => format!("✗ '{}' 已存在。", name),
+    }
+}
+fn fmt_dir_no_properties(lang: Lang, path: &Path) -> String {
+    match lang {
+        Lang::En => format!("✗ {} has no server.properties.", path.display()),
+        Lang::Zh => format!("✗ {} 中没有 server.properties。", path.display()),
+    }
+}
+fn fmt_dir_canon_failed(lang: Lang, path: &Path, err: &str) -> String {
+    match lang {
+        Lang::En => format!("✗ {}: {}", path.display(), err),
+        Lang::Zh => format!("✗ {}：{}", path.display(), err),
+    }
+}
+fn fmt_dir_switched(lang: Lang, path: &Path) -> String {
+    match lang {
+        Lang::En => format!("✓ Switched to {}.", path.display()),
+        Lang::Zh => format!("✓ 已切换到 {}。", path.display()),
+    }
+}
+fn fmt_already_whitelisted(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("→ '{}' already whitelisted.", name),
+        Lang::Zh => format!("→ '{}' 已在白名单。", name),
+    }
+}
+fn fmt_whitelist_added(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✓ Whitelisted {}.", name),
+        Lang::Zh => format!("✓ 已加入白名单：{}。", name),
+    }
+}
+fn fmt_whitelist_removed(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✓ Removed {} from whitelist.", name),
+        Lang::Zh => format!("✓ 已从白名单移除：{}。", name),
+    }
+}
+fn fmt_already_op(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("→ '{}' already op.", name),
+        Lang::Zh => format!("→ '{}' 已是 OP。", name),
+    }
+}
+fn fmt_op_added(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✓ Op'd {} (level 4).", name),
+        Lang::Zh => format!("✓ 已设为 OP：{}（级别 4）。", name),
+    }
+}
+fn fmt_op_removed(lang: Lang, name: &str) -> String {
+    match lang {
+        Lang::En => format!("✓ De-op'd {}.", name),
+        Lang::Zh => format!("✓ 已撤销 OP：{}。", name),
+    }
+}
+fn fmt_op_level_changed(lang: Lang, name: &str, level: u8) -> String {
+    match lang {
+        Lang::En => format!("✓ {} → level {}.", name, level),
+        Lang::Zh => format!("✓ {} → 级别 {}。", name, level),
+    }
+}
+fn fmt_config_saved(lang: Lang, key: &str, value: &str) -> String {
+    match lang {
+        Lang::En => format!("✓ {} = {}", key, value),
+        Lang::Zh => format!("✓ {} = {}", key, value),
+    }
+}
+fn fmt_lang_toggled(lang: Lang) -> String {
+    match lang {
+        Lang::En => "✓ Language: English.".into(),
+        Lang::Zh => "✓ 语言：中文。".into(),
+    }
+}
+fn fmt_start_script_missing(lang: Lang, path: &Path) -> String {
+    match lang {
+        Lang::En => format!("✗ {} not found. Create a start.sh first.", path.display()),
+        Lang::Zh => format!("✗ {} 不存在，请先创建 start.sh。", path.display()),
+    }
+}
+fn fmt_spawn_failed(lang: Lang, err: &str) -> String {
+    match lang {
+        Lang::En => format!("✗ Spawn failed: {}", err),
+        Lang::Zh => format!("✗ 启动失败: {}", err),
+    }
+}
+fn fmt_kill_failed(lang: Lang, err: &str) -> String {
+    match lang {
+        Lang::En => format!("✗ kill failed: {}", err),
+        Lang::Zh => format!("✗ kill 失败: {}", err),
+    }
+}
+fn fmt_stop_sent(lang: Lang, pid: u32) -> String {
+    match lang {
+        Lang::En => format!("→ SIGTERM → pid {}. Waiting for graceful shutdown…", pid),
+        Lang::Zh => format!("→ 已发送 SIGTERM → pid {}。等待平滑停服…", pid),
+    }
+}
+fn fmt_log_read_error(lang: Lang, err: &str) -> String {
+    match lang {
+        Lang::En => format!("(read error: {})", err),
+        Lang::Zh => format!("(读取失败: {})", err),
+    }
+}
+
+/// Pick `en` or `zh` based on `lang`. Kept for ad-hoc spots (rare); prefer
+/// `lang.s().<field>` or `fmt_*` helpers above.
+#[allow(dead_code)]
+fn t<'a>(lang: Lang, en: &'a str, zh: &'a str) -> &'a str {
+    match lang {
+        Lang::En => en,
+        Lang::Zh => zh,
+    }
+}
+
+/// Chinese annotation for common `server.properties` keys.
+/// Returns `None` for unknown keys (caller should fall back to showing only the raw key).
+fn property_zh(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "max-players" => "最大玩家数",
+        "view-distance" => "视距",
+        "simulation-distance" => "模拟距离",
+        "difficulty" => "难度",
+        "gamemode" => "默认游戏模式",
+        "pvp" => "PVP",
+        "hardcore" => "极限模式",
+        "online-mode" => "正版验证",
+        "white-list" => "启用白名单",
+        "enforce-whitelist" => "强制白名单",
+        "spawn-protection" => "出生点保护(格)",
+        "motd" => "服务器描述(MOTD)",
+        "level-name" => "世界名",
+        "level-type" => "世界类型",
+        "level-seed" => "世界种子",
+        "server-port" => "端口",
+        "server-ip" => "绑定 IP",
+        "max-world-size" => "世界大小上限",
+        "allow-flight" => "允许飞行",
+        "allow-nether" => "启用下界",
+        "spawn-monsters" => "生成怪物",
+        "spawn-animals" => "生成动物",
+        "spawn-npcs" => "生成村民等 NPC",
+        "enable-rcon" => "启用 RCON",
+        "rcon.password" => "RCON 密码",
+        "rcon.port" => "RCON 端口",
+        "enable-query" => "启用 Query",
+        "query.port" => "Query 端口",
+        "max-tick-time" => "最大 tick 时长",
+        "network-compression-threshold" => "网络压缩阈值",
+        "op-permission-level" => "OP 默认权限级别",
+        "function-permission-level" => "函数权限级别",
+        "broadcast-console-to-ops" => "控制台广播给 OP",
+        "broadcast-rcon-to-ops" => "RCON 广播给 OP",
+        "force-gamemode" => "强制默认模式",
+        "use-native-transport" => "使用原生传输",
+        "prevent-proxy-connections" => "禁止代理连接",
+        "generate-structures" => "生成结构",
+        "resource-pack" => "资源包 URL",
+        "resource-pack-prompt" => "资源包提示",
+        "require-resource-pack" => "强制资源包",
+        "hide-online-players" => "隐藏在线玩家",
+        "rate-limit" => "速率限制",
+        "player-idle-timeout" => "玩家闲置超时(分钟)",
+        "max-chained-neighbor-updates" => "链式邻接更新上限",
+        "sync-chunk-writes" => "同步区块写入",
+        "entity-broadcast-range-percentage" => "实体广播范围 %",
+        "log-ips" => "记录 IP",
+        "previews-chat" => "聊天预览",
+        "enable-status" => "启用状态查询",
+        "enable-jmx-monitoring" => "启用 JMX 监控",
+        "enable-command-block" => "启用命令方块",
+        "enforce-secure-profile" => "强制安全档案",
+        "snooper-enabled" => "发送统计信息",
+        "max-build-height" => "建筑高度上限",
+        "spawn-protection-radius" => "出生点保护半径",
+        "accepts-transfers" => "接受转移连接",
+        "bug-report-link" => "Bug 反馈链接",
+        "debug" => "调试模式",
+        "region-file-compression" => "区域文件压缩",
+        "text-filtering-config" => "文本过滤配置",
+        "text-filtering-version" => "文本过滤版本",
+        "pause-when-empty-seconds" => "无人时暂停秒数",
+        "enable-code-of-conduct" => "启用行为准则",
+        "initial-enabled-packs" => "初始启用数据包",
+        "initial-disabled-packs" => "初始禁用数据包",
+        _ => return None,
+    })
+}
+
+// ---------- Persistent state (state.toml) ----------
+
+fn config_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
+        if !p.is_empty() {
+            return PathBuf::from(p).join("mc-tui");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".config").join("mc-tui");
+    }
+    PathBuf::from(".mc-tui")
+}
+
+fn state_path() -> PathBuf {
+    config_dir().join("state.toml")
+}
+
+#[derive(Debug, Default, Clone)]
+struct PersistedState {
+    server_dir: Option<PathBuf>,
+    lang: Option<String>,
+}
+
+fn read_persisted_state() -> PersistedState {
+    let path = state_path();
+    let Ok(raw) = fs::read_to_string(&path) else {
+        return PersistedState::default();
+    };
+    let mut state = PersistedState::default();
+    for line in raw.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(eq) = line.find('=') {
+            let k = line[..eq].trim();
+            let v = line[eq + 1..].trim().trim_matches('"').to_string();
+            match k {
+                "server_dir" => state.server_dir = Some(PathBuf::from(v)),
+                "lang" => state.lang = Some(v),
+                _ => {}
+            }
+        }
+    }
+    state
+}
+
+fn write_persisted_state(state: &PersistedState) -> Result<()> {
+    let path = state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).ok();
+    }
+    let mut s = String::from("# mc-tui state — auto-managed, hand-edit at your own risk.\n");
+    if let Some(dir) = &state.server_dir {
+        s.push_str(&format!("server_dir = \"{}\"\n", dir.display()));
+    }
+    if let Some(lang) = &state.lang {
+        s.push_str(&format!("lang = \"{}\"\n", lang));
+    }
+    fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
 // ---------- App state ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,6 +816,8 @@ enum PromptAction {
     AddWhitelist,
     AddOp,
     EditConfig(String),
+    NewWorld,
+    ChangeServerDir,
 }
 
 struct App {
@@ -280,10 +836,20 @@ struct App {
 
     status: String,
     prompt: Option<InputPrompt>,
+
+    // Mouse hit-testing rects, populated each frame inside `ui()`.
+    tabs_rect: Rect,
+    list_rect: Rect,
+
+    lang: Lang,
 }
 
 impl App {
     fn new(server_dir: PathBuf) -> Result<Self> {
+        Self::new_with_lang(server_dir, Lang::default())
+    }
+
+    fn new_with_lang(server_dir: PathBuf, lang: Lang) -> Result<Self> {
         let server_dir = server_dir.canonicalize().with_context(|| {
             format!("server-dir does not exist: {}", server_dir.display())
         })?;
@@ -301,8 +867,14 @@ impl App {
             whitelist_state: ListState::default(),
             ops_state: ListState::default(),
             config_state: ListState::default(),
-            status: String::from("Ready."),
+            status: match lang {
+                Lang::En => String::from("Ready."),
+                Lang::Zh => String::from("就绪。"),
+            },
             prompt: None,
+            tabs_rect: Rect::default(),
+            list_rect: Rect::default(),
+            lang,
         };
         app.refresh_all();
         if !app.worlds.is_empty() {
@@ -377,19 +949,19 @@ impl App {
 
     fn switch_world(&mut self) -> Result<()> {
         if self.pid.is_some() {
-            self.status = "✗ Stop the server first (it's running).".into();
+            self.status = self.lang.s().err_stop_first.into();
             return Ok(());
         }
         let Some(idx) = self.worlds_state.selected() else { return Ok(()) };
         let Some(entry) = self.worlds.get(idx) else { return Ok(()) };
         if entry.is_current {
-            self.status = "→ Already current world.".into();
+            self.status = self.lang.s().err_already_current_world.into();
             return Ok(());
         }
         let new_name = entry.name.clone();
         set_property(&mut self.properties, "level-name", &new_name);
         write_properties(&self.server_dir.join("server.properties"), &self.properties)?;
-        self.status = format!("✓ Switched to '{}'. Restart the server to load it.", new_name);
+        self.status = fmt_world_switched(self.lang, &new_name);
         self.refresh_all();
         Ok(())
     }
@@ -400,7 +972,7 @@ impl App {
             return Ok(());
         }
         if self.whitelist.iter().any(|e| e.name == name) {
-            self.status = format!("→ '{}' already whitelisted.", name);
+            self.status = fmt_already_whitelisted(self.lang, name);
             return Ok(());
         }
         self.whitelist.push(WhitelistEntry {
@@ -408,7 +980,7 @@ impl App {
             name: name.to_string(),
         });
         write_whitelist(&self.server_dir, &self.whitelist)?;
-        self.status = format!("✓ Whitelisted {}.", name);
+        self.status = fmt_whitelist_added(self.lang, name);
         self.refresh_all();
         Ok(())
     }
@@ -420,7 +992,7 @@ impl App {
         }
         let removed = self.whitelist.remove(idx);
         write_whitelist(&self.server_dir, &self.whitelist)?;
-        self.status = format!("✓ Removed {} from whitelist.", removed.name);
+        self.status = fmt_whitelist_removed(self.lang, &removed.name);
         if self.whitelist.is_empty() {
             self.whitelist_state.select(None);
         } else if idx >= self.whitelist.len() {
@@ -435,7 +1007,7 @@ impl App {
             return Ok(());
         }
         if self.ops.iter().any(|e| e.name == name) {
-            self.status = format!("→ '{}' already op.", name);
+            self.status = fmt_already_op(self.lang, name);
             return Ok(());
         }
         self.ops.push(OpEntry {
@@ -445,7 +1017,7 @@ impl App {
             bypasses_player_limit: false,
         });
         write_ops(&self.server_dir, &self.ops)?;
-        self.status = format!("✓ Op'd {} (level 4).", name);
+        self.status = fmt_op_added(self.lang, name);
         self.refresh_all();
         Ok(())
     }
@@ -457,7 +1029,7 @@ impl App {
         }
         let removed = self.ops.remove(idx);
         write_ops(&self.server_dir, &self.ops)?;
-        self.status = format!("✓ De-op'd {}.", removed.name);
+        self.status = fmt_op_removed(self.lang, &removed.name);
         if self.ops.is_empty() {
             self.ops_state.select(None);
         } else if idx >= self.ops.len() {
@@ -475,16 +1047,187 @@ impl App {
         let new = (cur + dir as i16).clamp(1, 4) as u8;
         self.ops[idx].level = new;
         write_ops(&self.server_dir, &self.ops)?;
-        self.status = format!("✓ {} → level {}.", self.ops[idx].name, new);
+        let name = self.ops[idx].name.clone();
+        self.status = fmt_op_level_changed(self.lang, &name, new);
         Ok(())
     }
 
     fn save_config_value(&mut self, key: &str, value: &str) -> Result<()> {
         set_property(&mut self.properties, key, value);
         write_properties(&self.server_dir.join("server.properties"), &self.properties)?;
-        self.status = format!("✓ {} = {}", key, value);
+        self.status = fmt_config_saved(self.lang, key, value);
         Ok(())
     }
+
+    // -- v0.2: lifecycle --
+
+    fn start_server(&mut self) -> Result<()> {
+        if self.pid.is_some() {
+            self.status = self.lang.s().err_already_running.into();
+            return Ok(());
+        }
+        let script = self.server_dir.join("start.sh");
+        if !script.exists() {
+            self.status = fmt_start_script_missing(self.lang, &script);
+            return Ok(());
+        }
+        use std::process::{Command, Stdio};
+        // Use `setsid` on unix to detach the child into its own session so closing mc-tui doesn't HUP it.
+        // Fall back to plain bash on platforms without setsid.
+        let mut cmd = if cfg!(unix) && which("setsid").is_some() {
+            let mut c = Command::new("setsid");
+            c.arg("bash").arg(&script);
+            c
+        } else {
+            let mut c = Command::new("bash");
+            c.arg(&script);
+            c
+        };
+        cmd.current_dir(&self.server_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match cmd.spawn() {
+            Ok(_) => self.status = self.lang.s().spawn_started.into(),
+            Err(e) => self.status = fmt_spawn_failed(self.lang, &e.to_string()),
+        }
+        Ok(())
+    }
+
+    fn stop_server(&mut self) -> Result<()> {
+        let Some(pid) = self.pid else {
+            self.status = self.lang.s().err_not_running.into();
+            return Ok(());
+        };
+        use std::process::Command;
+        #[cfg(unix)]
+        let res = Command::new("kill").arg("-TERM").arg(pid.to_string()).status();
+        #[cfg(not(unix))]
+        let res = Command::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .status();
+        match res {
+            Ok(_) => self.status = fmt_stop_sent(self.lang, pid),
+            Err(e) => self.status = fmt_kill_failed(self.lang, &e.to_string()),
+        }
+        Ok(())
+    }
+
+    // -- v0.2: create new world --
+
+    fn create_new_world(&mut self, name: &str) -> Result<()> {
+        if self.pid.is_some() {
+            self.status = self.lang.s().err_stop_first.into();
+            return Ok(());
+        }
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(());
+        }
+        if name.contains('/')
+            || name.contains('\\')
+            || name == "."
+            || name == ".."
+            || name.contains('\0')
+        {
+            self.status = fmt_world_invalid(self.lang, name);
+            return Ok(());
+        }
+        let target = self.server_dir.join(name);
+        if target.exists() {
+            self.status = fmt_world_exists(self.lang, name);
+            return Ok(());
+        }
+        set_property(&mut self.properties, "level-name", name);
+        write_properties(&self.server_dir.join("server.properties"), &self.properties)?;
+        self.status = fmt_world_created(self.lang, name);
+        self.refresh_all();
+        Ok(())
+    }
+
+    // -- v0.3: language toggle --
+
+    fn toggle_lang(&mut self) {
+        self.lang = self.lang.toggle();
+        let mut state = read_persisted_state();
+        state.lang = Some(self.lang.code().to_string());
+        let _ = write_persisted_state(&state);
+        self.status = fmt_lang_toggled(self.lang);
+    }
+
+    // -- v0.2: change server-dir --
+
+    fn change_server_dir(&mut self, raw: &str) -> Result<()> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let path = expand_tilde(trimmed);
+        if !path.join("server.properties").exists() {
+            self.status = fmt_dir_no_properties(self.lang, &path);
+            return Ok(());
+        }
+        let canonical = match path.canonicalize() {
+            Ok(p) => p,
+            Err(e) => {
+                self.status = fmt_dir_canon_failed(self.lang, &path, &e.to_string());
+                return Ok(());
+            }
+        };
+        self.server_dir = canonical;
+        self.properties = read_properties(&self.server_dir.join("server.properties"))?;
+        self.refresh_all();
+
+        self.worlds_state = ListState::default();
+        if !self.worlds.is_empty() {
+            self.worlds_state.select(Some(0));
+        }
+        self.whitelist_state = ListState::default();
+        if !self.whitelist.is_empty() {
+            self.whitelist_state.select(Some(0));
+        }
+        self.ops_state = ListState::default();
+        if !self.ops.is_empty() {
+            self.ops_state.select(Some(0));
+        }
+        self.config_state = ListState::default();
+        if !self.properties.is_empty() {
+            self.config_state.select(Some(0));
+        }
+
+        let mut state = read_persisted_state();
+        state.server_dir = Some(self.server_dir.clone());
+        let _ = write_persisted_state(&state);
+
+        self.status = fmt_dir_switched(self.lang, &self.server_dir);
+        Ok(())
+    }
+}
+
+fn which(prog: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(prog);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn expand_tilde(p: &str) -> PathBuf {
+    if let Some(rest) = p.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home).join(rest);
+        }
+    }
+    if p == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return PathBuf::from(home);
+        }
+    }
+    PathBuf::from(p)
 }
 
 // ---------- UI ----------
@@ -502,6 +1245,8 @@ fn ui(f: &mut Frame, app: &mut App) {
 
     draw_status_bar(f, chunks[0], app);
     draw_tabs(f, chunks[1], app);
+    app.tabs_rect = chunks[1];
+    app.list_rect = chunks[2];
     match app.tab {
         TabId::Worlds => draw_worlds(f, chunks[2], app),
         TabId::Whitelist => draw_whitelist(f, chunks[2], app),
@@ -512,23 +1257,24 @@ fn ui(f: &mut Frame, app: &mut App) {
     draw_hints(f, chunks[3], app);
 
     if let Some(prompt) = app.prompt.clone() {
-        draw_prompt(f, &prompt);
+        draw_prompt(f, &prompt, app.lang);
     }
 }
 
 fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
     let pid_text = match app.pid {
-        Some(p) => Span::styled(format!("● running (pid {})", p), Style::default().fg(Color::Green)),
-        None => Span::styled("○ stopped", Style::default().fg(Color::DarkGray)),
+        Some(p) => Span::styled(fmt_status_running(app.lang, p), Style::default().fg(Color::Green)),
+        None => Span::styled(s.status_stopped, Style::default().fg(Color::DarkGray)),
     };
     let line = Line::from(vec![
-        Span::styled("server: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(s.server_label, Style::default().add_modifier(Modifier::DIM)),
         pid_text,
         Span::raw("    "),
-        Span::styled("level: ", Style::default().add_modifier(Modifier::DIM)),
-        Span::styled(app.current_level(), Style::default().fg(Color::Cyan)),
+        Span::styled(s.level_label, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(app.current_level().to_string(), Style::default().fg(Color::Cyan)),
         Span::raw("    "),
-        Span::styled("dir: ", Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(s.dir_label, Style::default().add_modifier(Modifier::DIM)),
         Span::raw(app.server_dir.display().to_string()),
     ]);
     let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" mc-tui "));
@@ -539,7 +1285,9 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
     let titles: Vec<Line> = TABS
         .iter()
         .enumerate()
-        .map(|(i, (_, name))| Line::from(format!(" {} {} ", i + 1, name)))
+        .map(|(i, (id, _en))| {
+            Line::from(format!(" {} {} ", i + 1, tab_name(app.lang, *id)))
+        })
         .collect();
     let selected = TABS.iter().position(|(t, _)| *t == app.tab).unwrap_or(0);
     let tabs = Tabs::new(titles)
@@ -577,7 +1325,7 @@ fn draw_worlds(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Worlds (●=current) "))
+        .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_worlds))
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.worlds_state);
@@ -595,7 +1343,7 @@ fn draw_whitelist(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Whitelist "))
+        .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_whitelist))
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.whitelist_state);
@@ -614,13 +1362,14 @@ fn draw_ops(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" Operators (←/→ change level) "))
+        .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_ops))
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.ops_state);
 }
 
 fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
+    let lang = app.lang;
     let items: Vec<ListItem> = app
         .properties
         .iter()
@@ -630,15 +1379,30 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
                 "false" => Color::Red,
                 _ => Color::Cyan,
             };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!(" {:35}", k), Style::default().fg(Color::White)),
                 Span::raw("= "),
-                Span::styled(v, Style::default().fg(value_color)),
-            ]))
+                Span::styled(v.clone(), Style::default().fg(value_color)),
+            ];
+            // In zh mode, append a dim Chinese annotation if we know one for this key.
+            if lang == Lang::Zh {
+                if let Some(annot) = property_zh(k) {
+                    spans.push(Span::raw("    "));
+                    spans.push(Span::styled(
+                        format!("// {}", annot),
+                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                    ));
+                }
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(" server.properties (Enter = edit) "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.lang.s().title_config),
+        )
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.config_state);
@@ -655,29 +1419,20 @@ fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
                 let start = n.saturating_sub(take);
                 lines[start..].join("\n")
             }
-            Err(e) => format!("(read error: {e})"),
+            Err(e) => fmt_log_read_error(app.lang, &e.to_string()),
         }
     } else {
-        "(no logs yet)".to_string()
+        app.lang.s().no_logs_yet.to_string()
     };
+    let title = format!("{}{} ", app.lang.s().title_logs_prefix, log_path.display());
     let p = Paragraph::new(body)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(format!(" Logs — tail of {} ", log_path.display())),
-        )
+        .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
 
 fn draw_hints(f: &mut Frame, area: Rect, app: &App) {
-    let hint = match app.tab {
-        TabId::Worlds => "↑/↓ select   Enter switch   r refresh   Tab/1-5 tabs   q quit",
-        TabId::Whitelist => "↑/↓ select   a add   d remove   r refresh   Tab/1-5 tabs   q quit",
-        TabId::Ops => "↑/↓ select   a add   d remove   ←/→ level   r refresh   Tab/1-5 tabs   q quit",
-        TabId::Config => "↑/↓ select   Enter edit   r refresh   Tab/1-5 tabs   q quit",
-        TabId::Logs => "r refresh   Tab/1-5 tabs   q quit",
-    };
+    let hint = hint_for(app.lang, app.tab);
     let line = Line::from(vec![
         Span::styled(format!(" {} ", hint), Style::default().fg(Color::DarkGray)),
         Span::raw("  │  "),
@@ -687,7 +1442,7 @@ fn draw_hints(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-fn draw_prompt(f: &mut Frame, prompt: &InputPrompt) {
+fn draw_prompt(f: &mut Frame, prompt: &InputPrompt, lang: Lang) {
     let area = centered_rect(60, 5, f.area());
     f.render_widget(ratatui::widgets::Clear, area);
     let block = Block::default()
@@ -708,7 +1463,7 @@ fn draw_prompt(f: &mut Frame, prompt: &InputPrompt) {
         ]),
         Line::raw(""),
         Line::from(Span::styled(
-            "Enter = confirm    Esc = cancel",
+            lang.s().prompt_confirm_cancel,
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -738,7 +1493,15 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             continue;
         }
 
-        let Event::Key(key) = event::read()? else { continue };
+        let ev = event::read()?;
+        let key = match ev {
+            Event::Key(k) => k,
+            Event::Mouse(me) => {
+                handle_mouse(app, me);
+                continue;
+            }
+            _ => continue,
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
@@ -746,7 +1509,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
         if let Some(mut prompt) = app.prompt.take() {
             match key.code {
                 KeyCode::Esc => {
-                    app.status = "Cancelled.".into();
+                    app.status = app.lang.s().cancelled.into();
                 }
                 KeyCode::Enter => {
                     let value = prompt.buffer.clone();
@@ -754,6 +1517,8 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         PromptAction::AddWhitelist => app.add_whitelist(&value)?,
                         PromptAction::AddOp => app.add_op(&value)?,
                         PromptAction::EditConfig(key) => app.save_config_value(&key, &value)?,
+                        PromptAction::NewWorld => app.create_new_world(&value)?,
+                        PromptAction::ChangeServerDir => app.change_server_dir(&value)?,
                     }
                 }
                 KeyCode::Backspace => {
@@ -782,7 +1547,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             KeyCode::BackTab => app.cycle_tab(-1),
             KeyCode::Char('r') => {
                 app.refresh_all();
-                app.status = "Refreshed.".into();
+                app.status = app.lang.s().refreshed.into();
             }
             KeyCode::Up => app.move_selection(-1),
             KeyCode::Down => app.move_selection(1),
@@ -791,9 +1556,13 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                 TabId::Config => {
                     if let Some(idx) = app.config_state.selected() {
                         if let Some((k, v)) = app.properties.get(idx).cloned() {
+                            let title = match app.lang {
+                                Lang::En => format!("Edit {}", k),
+                                Lang::Zh => format!("编辑 {}", k),
+                            };
                             app.prompt = Some(InputPrompt {
-                                title: format!("Edit {}", k),
-                                label: "value".into(),
+                                title,
+                                label: app.lang.s().prompt_label_value.into(),
                                 buffer: v,
                                 action: PromptAction::EditConfig(k),
                             });
@@ -804,17 +1573,19 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             },
             KeyCode::Char('a') => match app.tab {
                 TabId::Whitelist => {
+                    let s = app.lang.s();
                     app.prompt = Some(InputPrompt {
-                        title: "Add to whitelist".into(),
-                        label: "player name".into(),
+                        title: s.prompt_title_add_whitelist.into(),
+                        label: s.prompt_label_player.into(),
                         buffer: String::new(),
                         action: PromptAction::AddWhitelist,
                     });
                 }
                 TabId::Ops => {
+                    let s = app.lang.s();
                     app.prompt = Some(InputPrompt {
-                        title: "Op a player".into(),
-                        label: "player name".into(),
+                        title: s.prompt_title_op_player.into(),
+                        label: s.prompt_label_player.into(),
                         buffer: String::new(),
                         action: PromptAction::AddOp,
                     });
@@ -836,14 +1607,129 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     app.cycle_op_level(1)?;
                 }
             }
+            // v0.2 new keys
+            KeyCode::Char('S') => app.start_server()?,
+            KeyCode::Char('X') => app.stop_server()?,
+            // v0.3 language toggle
+            KeyCode::Char('L') => app.toggle_lang(),
+            KeyCode::Char('N') => {
+                if app.tab == TabId::Worlds {
+                    let s = app.lang.s();
+                    app.prompt = Some(InputPrompt {
+                        title: s.prompt_title_new_world.into(),
+                        label: s.prompt_label_world.into(),
+                        buffer: String::new(),
+                        action: PromptAction::NewWorld,
+                    });
+                }
+            }
+            KeyCode::Char('D') => {
+                let s = app.lang.s();
+                app.prompt = Some(InputPrompt {
+                    title: s.prompt_title_change_dir.into(),
+                    label: s.prompt_label_path.into(),
+                    buffer: app.server_dir.display().to_string(),
+                    action: PromptAction::ChangeServerDir,
+                });
+            }
             _ => {}
         }
     }
 }
 
+fn handle_mouse(app: &mut App, me: MouseEvent) {
+    if !matches!(me.kind, MouseEventKind::Down(MouseButton::Left)) {
+        return;
+    }
+    let (col, row) = (me.column, me.row);
+
+    if rect_contains(app.tabs_rect, col, row) {
+        // ratatui Tabs widget renders titles as " 1 Worlds " " │ " " 2 Whitelist " ...
+        // Compute cumulative widths to find which tab was clicked.
+        let inner_x = app.tabs_rect.x.saturating_add(1);
+        if col < inner_x {
+            return;
+        }
+        let dx = col - inner_x;
+        let mut x: u16 = 0;
+        for (i, (id, name)) in TABS.iter().enumerate() {
+            // Title format: " {idx} {name} " (matches draw_tabs).
+            let title_len = format!(" {} {} ", i + 1, name).chars().count() as u16;
+            let divider_len: u16 = if i + 1 < TABS.len() { 3 } else { 0 }; // ratatui Tabs default divider " │ "
+            if dx >= x && dx < x + title_len {
+                app.tab = *id;
+                return;
+            }
+            x = x + title_len + divider_len;
+        }
+        return;
+    }
+
+    if rect_contains(app.list_rect, col, row) {
+        // Block has 1-cell border; rows render at y+1..y+height-1.
+        let inner_y = app.list_rect.y.saturating_add(1);
+        let inner_h = app.list_rect.height.saturating_sub(2);
+        if row < inner_y {
+            return;
+        }
+        let row_in_list = (row - inner_y) as usize;
+        if row_in_list >= inner_h as usize {
+            return;
+        }
+        let tab = app.tab;
+        let len = app.list_len_for(tab);
+        if len == 0 {
+            return;
+        }
+        let state = app.list_state_for(tab);
+        let target = state.offset() + row_in_list;
+        if target < len {
+            state.select(Some(target));
+        }
+    }
+}
+
+fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
+    x >= r.x && x < r.x.saturating_add(r.width) && y >= r.y && y < r.y.saturating_add(r.height)
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let mut app = App::new(cli.server_dir)?;
+
+    // Sub-commands dispatch first.
+    match cli.command {
+        Some(Cmd::New {
+            dir,
+            force,
+            mc_version,
+            server_type,
+            first_boot,
+        }) => {
+            return scaffold_new(&dir, force, mc_version.as_deref(), server_type, first_boot);
+        }
+        Some(Cmd::Screenshot {
+            tab,
+            width,
+            height,
+            lang,
+        }) => {
+            let server_dir = resolve_server_dir(cli.server_dir.clone())?;
+            return render_screenshot(&server_dir, &tab, width, height, &lang);
+        }
+        Some(Cmd::Run) | None => {}
+    }
+
+    let server_dir = resolve_server_dir(cli.server_dir)?;
+    let mut state = read_persisted_state();
+    let lang = state.lang.as_deref().map(Lang::from_code).unwrap_or_default();
+    let mut app = App::new_with_lang(server_dir.clone(), lang)?;
+
+    // Persist this dir as last-good.
+    state.server_dir = Some(server_dir);
+    if state.lang.is_none() {
+        state.lang = Some(lang.code().to_string());
+    }
+    let _ = write_persisted_state(&state);
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -858,6 +1744,80 @@ fn main() -> Result<()> {
     terminal.show_cursor()?;
 
     res
+}
+
+fn resolve_server_dir(cli_arg: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(p) = cli_arg {
+        return Ok(p);
+    }
+    let state = read_persisted_state();
+    if let Some(p) = state.server_dir {
+        if p.join("server.properties").exists() {
+            eprintln!("(using remembered server-dir: {})", p.display());
+            return Ok(p);
+        }
+        anyhow::bail!(
+            "remembered server-dir {} no longer has server.properties — pass --server-dir",
+            p.display()
+        );
+    }
+    anyhow::bail!(
+        "no --server-dir given and no remembered dir at {} — pass --server-dir or MC_SERVER_DIR",
+        state_path().display()
+    );
+}
+
+fn scaffold_new(
+    dir: &Path,
+    _force: bool,
+    _mc_version: Option<&str>,
+    _server_type: ServerType,
+    _first_boot: bool,
+) -> Result<()> {
+    eprintln!("scaffold_new: not implemented yet (planned for v0.4). dir={}", dir.display());
+    anyhow::bail!("`mc-tui new` is not implemented yet");
+}
+
+fn render_screenshot(
+    server_dir: &Path,
+    tab: &str,
+    width: u16,
+    height: u16,
+    lang: &str,
+) -> Result<()> {
+    use ratatui::backend::TestBackend;
+    let lang = Lang::from_code(lang);
+    let mut app = App::new_with_lang(server_dir.to_path_buf(), lang)?;
+    app.tab = match tab.to_ascii_lowercase().as_str() {
+        "worlds" => TabId::Worlds,
+        "whitelist" => TabId::Whitelist,
+        "ops" => TabId::Ops,
+        "config" => TabId::Config,
+        "logs" => TabId::Logs,
+        other => anyhow::bail!("unknown tab: {}", other),
+    };
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend)?;
+    terminal.draw(|f| ui(f, &mut app))?;
+    let buffer = terminal.backend().buffer().clone();
+    // Render buffer cells to plain text (one line per row).
+    // ratatui stores a wide char (CJK, fullwidth) in one cell and pads the next cell
+    // with an empty/space symbol; advance by the rendered width so we don't double up.
+    use unicode_width::UnicodeWidthStr;
+    for y in 0..buffer.area.height {
+        let mut line = String::new();
+        let mut x = 0;
+        while x < buffer.area.width {
+            let cell = &buffer[(x, y)];
+            let sym = cell.symbol();
+            line.push_str(sym);
+            let w = UnicodeWidthStr::width(sym).max(1) as u16;
+            x = x.saturating_add(w);
+        }
+        let trimmed = line.trim_end();
+        println!("{}", trimmed);
+    }
+    Ok(())
 }
 
 // ---------- Tests ----------
@@ -961,5 +1921,119 @@ mod tests {
         ));
         fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn expand_tilde_replaces_home() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let p = expand_tilde("~/foo/bar");
+        assert!(p.starts_with(&home), "expected {} to start with {}", p.display(), home);
+        let p = expand_tilde("/abs/path");
+        assert_eq!(p, PathBuf::from("/abs/path"));
+        let p = expand_tilde("~");
+        assert_eq!(p, PathBuf::from(&home));
+    }
+
+    #[test]
+    fn persisted_state_roundtrip() {
+        let dir = tempdir();
+        let state_file = dir.join("state.toml");
+        // Write directly so we exercise the parser.
+        fs::write(
+            &state_file,
+            "# header\nserver_dir = \"/srv/mc\"\nlang = \"zh\"\n",
+        )
+        .unwrap();
+        // Reuse parser via a tiny shim that mimics read_persisted_state but takes a path.
+        let raw = fs::read_to_string(&state_file).unwrap();
+        let mut server_dir: Option<PathBuf> = None;
+        let mut lang: Option<String> = None;
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(eq) = line.find('=') {
+                let k = line[..eq].trim();
+                let v = line[eq + 1..].trim().trim_matches('"').to_string();
+                match k {
+                    "server_dir" => server_dir = Some(PathBuf::from(v)),
+                    "lang" => lang = Some(v),
+                    _ => {}
+                }
+            }
+        }
+        assert_eq!(server_dir, Some(PathBuf::from("/srv/mc")));
+        assert_eq!(lang.as_deref(), Some("zh"));
+    }
+
+    #[test]
+    fn lang_codes_roundtrip() {
+        assert_eq!(Lang::from_code("zh"), Lang::Zh);
+        assert_eq!(Lang::from_code("en"), Lang::En);
+        assert_eq!(Lang::from_code(""), Lang::En);
+        assert_eq!(Lang::from_code("zh-CN"), Lang::Zh);
+        assert_eq!(Lang::Zh.code(), "zh");
+        assert_eq!(Lang::En.code(), "en");
+        assert_eq!(Lang::En.toggle(), Lang::Zh);
+        assert_eq!(Lang::Zh.toggle(), Lang::En);
+    }
+
+    #[test]
+    fn property_zh_covers_common_keys() {
+        for key in [
+            "max-players",
+            "view-distance",
+            "difficulty",
+            "gamemode",
+            "pvp",
+            "online-mode",
+            "white-list",
+            "motd",
+            "level-name",
+            "server-port",
+        ] {
+            assert!(property_zh(key).is_some(), "missing zh annotation for {key}");
+        }
+        // Unknown keys should return None, not a fallback string.
+        assert!(property_zh("not-a-real-key").is_none());
+    }
+
+    #[test]
+    fn strings_struct_fields_nonempty_in_both_langs() {
+        // Spot-check a few fields — important ones we know we render.
+        for s in [&EN, &ZH] {
+            assert!(!s.ready.is_empty());
+            assert!(!s.refreshed.is_empty());
+            assert!(!s.tab_worlds.is_empty());
+            assert!(!s.hint_worlds.is_empty());
+            assert!(!s.title_logs_prefix.is_empty());
+            assert!(!s.prompt_confirm_cancel.is_empty());
+        }
+    }
+
+    #[test]
+    fn fmt_helpers_return_lang_appropriate_strings() {
+        let en = fmt_world_switched(Lang::En, "test");
+        let zh = fmt_world_switched(Lang::Zh, "test");
+        assert!(en.contains("Switched"));
+        assert!(zh.contains("已切换"));
+        assert!(en != zh);
+
+        let en = fmt_status_running(Lang::En, 42);
+        let zh = fmt_status_running(Lang::Zh, 42);
+        assert!(en.contains("running"));
+        assert!(zh.contains("运行中"));
+        assert!(en.contains("42") && zh.contains("42"));
+    }
+
+    #[test]
+    fn rect_contains_basic() {
+        let r = Rect { x: 10, y: 20, width: 30, height: 5 };
+        assert!(rect_contains(r, 10, 20));
+        assert!(rect_contains(r, 39, 24));
+        assert!(!rect_contains(r, 9, 20));
+        assert!(!rect_contains(r, 40, 20));
+        assert!(!rect_contains(r, 10, 25));
     }
 }
