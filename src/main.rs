@@ -2365,26 +2365,6 @@ fn draw_join_bar(f: &mut Frame, area: Rect, app: &mut App) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         ));
-
-        // Hint about other addresses in Server tab.
-        spans.push(Span::raw("    "));
-        let extra = nics
-            .iter()
-            .filter(|m| {
-                !matches!(
-                    m.kind,
-                    NicKind::Loopback | NicKind::Docker | NicKind::Tun
-                )
-            })
-            .count()
-            .saturating_sub(1);
-        if extra > 0 {
-            let more = match app.lang {
-                Lang::En => format!("(+{} more on Server tab)", extra),
-                Lang::Zh => format!("(+{} 个在 9 运维)", extra),
-            };
-            spans.push(Span::styled(more, Style::default().fg(Color::DarkGray)));
-        }
     } else {
         spans.push(Span::styled(
             match app.lang {
