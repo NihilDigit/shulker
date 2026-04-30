@@ -77,6 +77,9 @@ enum Cmd {
         /// Language: en or zh.
         #[arg(long, default_value = "en")]
         lang: String,
+        /// 0-based index of the row to highlight (for detail-panel QA).
+        #[arg(long, default_value_t = 0)]
+        select: usize,
     },
 }
 
@@ -100,11 +103,20 @@ impl ServerType {
 #[derive(Debug, Clone)]
 struct WorldEntry {
     name: String,
-    #[allow(dead_code)]
     path: PathBuf,
     size_bytes: u64,
     last_modified: Option<chrono::DateTime<chrono::Local>>,
     is_current: bool,
+    playerdata_count: usize,
+    has_level_dat: bool,
+}
+
+fn count_playerdata(world_path: &Path) -> usize {
+    let dir = world_path.join("playerdata");
+    let Ok(rd) = fs::read_dir(&dir) else { return 0 };
+    rd.filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "dat").unwrap_or(false))
+        .count()
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -223,7 +235,17 @@ fn scan_worlds(server_dir: &Path, current_level: &str) -> Vec<WorldEntry> {
             .ok()
             .map(chrono::DateTime::<chrono::Local>::from);
         let is_current = name == current_level;
-        out.push(WorldEntry { name, path, size_bytes, last_modified, is_current });
+        let playerdata_count = count_playerdata(&path);
+        let has_level_dat = path.join("level.dat").is_file();
+        out.push(WorldEntry {
+            name,
+            path,
+            size_bytes,
+            last_modified,
+            is_current,
+            playerdata_count,
+            has_level_dat,
+        });
     }
     out.sort_by(|a, b| b.is_current.cmp(&a.is_current).then(a.name.cmp(&b.name)));
     out
@@ -383,6 +405,30 @@ struct Strings {
     detail_default: &'static str,
     detail_range: &'static str,
     detail_no_info: &'static str,
+    detail_title: &'static str,
+    detail_no_selection: &'static str,
+    detail_no_metadata: &'static str,
+    detail_path: &'static str,
+    detail_size: &'static str,
+    detail_modified: &'static str,
+    detail_uuid: &'static str,
+    detail_level: &'static str,
+    detail_level_meaning: &'static str,
+    detail_bypass: &'static str,
+    detail_restart_required: &'static str,
+    detail_description: &'static str,
+    detail_playerdata_count: &'static str,
+    detail_has_level_dat: &'static str,
+    detail_offline_uuid_note: &'static str,
+    detail_op_level_1: &'static str,
+    detail_op_level_2: &'static str,
+    detail_op_level_3: &'static str,
+    detail_op_level_4: &'static str,
+    detail_is_current: &'static str,
+    detail_key: &'static str,
+    detail_value: &'static str,
+    detail_yes: &'static str,
+    detail_no: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -430,6 +476,30 @@ const EN: Strings = Strings {
     detail_default: "Default",
     detail_range: "Range",
     detail_no_info: "(no extra info)",
+    detail_title: " Details ",
+    detail_no_selection: "(nothing selected)",
+    detail_no_metadata: "(no metadata for this key)",
+    detail_path: "Path",
+    detail_size: "Size",
+    detail_modified: "Modified",
+    detail_uuid: "UUID",
+    detail_level: "Level",
+    detail_level_meaning: "Means",
+    detail_bypass: "Bypasses player limit",
+    detail_restart_required: "Restart required",
+    detail_description: "Description",
+    detail_playerdata_count: "Playerdata files",
+    detail_has_level_dat: "level.dat",
+    detail_offline_uuid_note: "Offline UUID = md5(\"OfflinePlayer:\" + name) (Java/Paper offline mode).",
+    detail_op_level_1: "Spawn-protection bypass; basic OP commands.",
+    detail_op_level_2: "Cheat-style commands (/give, /tp, /gamemode).",
+    detail_op_level_3: "Multi-player admin (/ban, /kick, /op, /deop).",
+    detail_op_level_4: "Server admin (/stop, /save-all, /reload).",
+    detail_is_current: "Currently loaded",
+    detail_key: "Key",
+    detail_value: "Value",
+    detail_yes: "yes",
+    detail_no: "no",
 };
 
 const ZH: Strings = Strings {
@@ -477,6 +547,30 @@ const ZH: Strings = Strings {
     detail_default: "默认",
     detail_range: "取值",
     detail_no_info: "(暂无说明)",
+    detail_title: " 详情 ",
+    detail_no_selection: "(未选中)",
+    detail_no_metadata: "(此键暂无元信息)",
+    detail_path: "路径",
+    detail_size: "大小",
+    detail_modified: "修改时间",
+    detail_uuid: "UUID",
+    detail_level: "级别",
+    detail_level_meaning: "含义",
+    detail_bypass: "绕过玩家上限",
+    detail_restart_required: "需要重启",
+    detail_description: "说明",
+    detail_playerdata_count: "玩家数据文件数",
+    detail_has_level_dat: "level.dat",
+    detail_offline_uuid_note: "离线 UUID = md5(\"OfflinePlayer:\" + name)（Java/Paper 离线模式）。",
+    detail_op_level_1: "绕过出生点保护；基础 OP 命令。",
+    detail_op_level_2: "作弊类命令 (/give, /tp, /gamemode)。",
+    detail_op_level_3: "多人管理 (/ban, /kick, /op, /deop)。",
+    detail_op_level_4: "服务器管理 (/stop, /save-all, /reload)。",
+    detail_is_current: "正在加载",
+    detail_key: "键",
+    detail_value: "值",
+    detail_yes: "是",
+    detail_no: "否",
 };
 
 // Parametric messages — return owned Strings.
@@ -719,6 +813,189 @@ fn property_zh(key: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+
+// ---------- Property metadata (for the Config detail panel) ----------
+
+struct PropertyMeta {
+    description_en: &'static str,
+    description_zh: &'static str,
+    default: &'static str,
+    range: &'static str,
+    restart_required: bool,
+}
+
+fn property_metadata(key: &str) -> Option<&'static PropertyMeta> {
+    PROPERTY_META.iter().find(|(k, _)| *k == key).map(|(_, m)| m)
+}
+
+#[rustfmt::skip]
+const PROPERTY_META: &[(&str, PropertyMeta)] = &[
+    ("max-players", PropertyMeta {
+        description_en: "Maximum number of players that can join the server at once.",
+        description_zh: "服务器同时在线玩家上限。",
+        default: "20", range: "1–2147483647", restart_required: true,
+    }),
+    ("view-distance", PropertyMeta {
+        description_en: "Server-side render distance, in chunks. Larger = more CPU/RAM.",
+        description_zh: "服务器视距（区块）。越大越吃 CPU/内存。",
+        default: "10", range: "3–32", restart_required: true,
+    }),
+    ("simulation-distance", PropertyMeta {
+        description_en: "Distance (chunks) within which entities tick / mobs spawn.",
+        description_zh: "实体 tick 与生物刷新的距离（区块）。",
+        default: "10", range: "3–32", restart_required: true,
+    }),
+    ("difficulty", PropertyMeta {
+        description_en: "World difficulty level.",
+        description_zh: "世界难度。",
+        default: "easy", range: "peaceful|easy|normal|hard", restart_required: false,
+    }),
+    ("gamemode", PropertyMeta {
+        description_en: "Default game mode for joining players.",
+        description_zh: "新加入玩家的默认游戏模式。",
+        default: "survival", range: "survival|creative|adventure|spectator", restart_required: false,
+    }),
+    ("pvp", PropertyMeta {
+        description_en: "Allow players to damage each other.",
+        description_zh: "是否允许玩家间伤害。",
+        default: "true", range: "true|false", restart_required: false,
+    }),
+    ("hardcore", PropertyMeta {
+        description_en: "Hardcore mode: death = banned, difficulty locked to hard.",
+        description_zh: "极限模式：死亡即封禁，难度锁定 hard。",
+        default: "false", range: "true|false", restart_required: true,
+    }),
+    ("online-mode", PropertyMeta {
+        description_en: "Verify players against Mojang auth. false = offline / cracked.",
+        description_zh: "是否对 Mojang 验证玩家。false 为离线/盗版。",
+        default: "true", range: "true|false", restart_required: true,
+    }),
+    ("white-list", PropertyMeta {
+        description_en: "Enable the whitelist. Only listed players can join.",
+        description_zh: "启用白名单，只有名单内玩家可加入。",
+        default: "false", range: "true|false", restart_required: false,
+    }),
+    ("enforce-whitelist", PropertyMeta {
+        description_en: "Kick non-whitelisted players already online when whitelist is reloaded.",
+        description_zh: "重载白名单时，踢出已在线但不在名单的玩家。",
+        default: "false", range: "true|false", restart_required: false,
+    }),
+    ("spawn-protection", PropertyMeta {
+        description_en: "Radius (blocks) around spawn that non-ops cannot break.",
+        description_zh: "出生点保护半径（方块），非 op 无法破坏。",
+        default: "16", range: "0–...", restart_required: false,
+    }),
+    ("motd", PropertyMeta {
+        description_en: "Message of the day shown in the server list.",
+        description_zh: "在服务器列表中显示的欢迎语。",
+        default: "A Minecraft Server", range: "any string", restart_required: false,
+    }),
+    ("level-name", PropertyMeta {
+        description_en: "Folder name of the world to load on next start.",
+        description_zh: "下次启动时加载的世界文件夹名。",
+        default: "world", range: "directory name", restart_required: true,
+    }),
+    ("level-type", PropertyMeta {
+        description_en: "World generation preset (normal, flat, large_biomes, ...).",
+        description_zh: "世界生成预设（normal、flat、large_biomes 等）。",
+        default: "minecraft\\:normal", range: "minecraft:<type>", restart_required: true,
+    }),
+    ("level-seed", PropertyMeta {
+        description_en: "Seed for world generation. Empty = random.",
+        description_zh: "世界生成种子。留空则随机。",
+        default: "", range: "any string or number", restart_required: true,
+    }),
+    ("server-port", PropertyMeta {
+        description_en: "TCP port the server listens on.",
+        description_zh: "服务器监听的 TCP 端口。",
+        default: "25565", range: "1–65535", restart_required: true,
+    }),
+    ("allow-flight", PropertyMeta {
+        description_en: "Permit clients with flight mods (e.g. creative-style flight).",
+        description_zh: "允许带飞行 mod 的客户端飞行。",
+        default: "false", range: "true|false", restart_required: false,
+    }),
+    ("allow-nether", PropertyMeta {
+        description_en: "Allow players to enter the Nether.",
+        description_zh: "是否允许进入下界。",
+        default: "true", range: "true|false", restart_required: true,
+    }),
+    ("spawn-monsters", PropertyMeta {
+        description_en: "Whether hostile mobs spawn.",
+        description_zh: "是否刷新敌对生物。",
+        default: "true", range: "true|false", restart_required: false,
+    }),
+    ("spawn-animals", PropertyMeta {
+        description_en: "Whether passive animals spawn.",
+        description_zh: "是否刷新被动动物。",
+        default: "true", range: "true|false", restart_required: false,
+    }),
+    ("enable-rcon", PropertyMeta {
+        description_en: "Expose an RCON port for remote console.",
+        description_zh: "开启 RCON 远程控制台。",
+        default: "false", range: "true|false", restart_required: true,
+    }),
+    ("rcon.password", PropertyMeta {
+        description_en: "Password for RCON. Required if enable-rcon=true.",
+        description_zh: "RCON 密码。enable-rcon 为 true 时必填。",
+        default: "", range: "any string", restart_required: true,
+    }),
+    ("rcon.port", PropertyMeta {
+        description_en: "TCP port for the RCON server.",
+        description_zh: "RCON 监听的 TCP 端口。",
+        default: "25575", range: "1–65535", restart_required: true,
+    }),
+    ("op-permission-level", PropertyMeta {
+        description_en: "Default permission level granted to a newly added op (1–4).",
+        description_zh: "新增 op 时默认授予的权限级别（1–4）。",
+        default: "4", range: "1–4", restart_required: false,
+    }),
+    ("function-permission-level", PropertyMeta {
+        description_en: "Permission level used when running /function and command-block commands.",
+        description_zh: "执行 /function 与命令方块命令时的权限级别。",
+        default: "2", range: "1–4", restart_required: false,
+    }),
+    ("network-compression-threshold", PropertyMeta {
+        description_en: "Packet size (bytes) above which packets are compressed. -1 = off.",
+        description_zh: "超过该字节数的数据包会被压缩。-1 为关闭。",
+        default: "256", range: "-1, 0–...", restart_required: true,
+    }),
+    ("max-tick-time", PropertyMeta {
+        description_en: "Watchdog timeout in ms — server is killed if a single tick exceeds this.",
+        description_zh: "看门狗超时（毫秒）。单 tick 超过此值会强制结束服务器。",
+        default: "60000", range: "milliseconds, -1 to disable", restart_required: true,
+    }),
+    ("force-gamemode", PropertyMeta {
+        description_en: "Force players to default gamemode every time they join.",
+        description_zh: "每次加入都强制玩家回到默认游戏模式。",
+        default: "false", range: "true|false", restart_required: false,
+    }),
+    ("generate-structures", PropertyMeta {
+        description_en: "Generate structures (villages, fortresses, ...) in newly loaded chunks.",
+        description_zh: "新区块是否生成结构（村庄、要塞等）。",
+        default: "true", range: "true|false", restart_required: true,
+    }),
+    ("resource-pack", PropertyMeta {
+        description_en: "URL of an optional server resource pack.",
+        description_zh: "可选的服务器资源包 URL。",
+        default: "", range: "URL", restart_required: false,
+    }),
+    ("require-resource-pack", PropertyMeta {
+        description_en: "Disconnect players who reject the server resource pack.",
+        description_zh: "拒绝服务器资源包的玩家会被踢出。",
+        default: "false", range: "true|false", restart_required: false,
+    }),
+    ("player-idle-timeout", PropertyMeta {
+        description_en: "Minutes of idle before a player is kicked. 0 = never.",
+        description_zh: "玩家挂机超过该分钟数会被踢出。0 = 不踢。",
+        default: "0", range: "minutes", restart_required: false,
+    }),
+    ("entity-broadcast-range-percentage", PropertyMeta {
+        description_en: "Distance (percent of view-distance) at which entities are sent to clients.",
+        description_zh: "实体广播给客户端的距离（视距百分比）。",
+        default: "100", range: "10–1000", restart_required: false,
+    }),
+];
 
 // ---------- Persistent state (state.toml) ----------
 
@@ -1304,6 +1581,7 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_worlds(f: &mut Frame, area: Rect, app: &mut App) {
+    let (list_area, detail_area) = split_list_detail(area);
     let items: Vec<ListItem> = app
         .worlds
         .iter()
@@ -1328,10 +1606,71 @@ fn draw_worlds(f: &mut Frame, area: Rect, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_worlds))
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut app.worlds_state);
+    f.render_stateful_widget(list, list_area, &mut app.worlds_state);
+    if let Some(da) = detail_area {
+        draw_world_detail(f, da, app);
+    }
+}
+
+/// Split a content area horizontally into `(list, detail)`. If the screen is
+/// narrower than 90 cols the detail panel is hidden (single-pane fallback).
+fn split_list_detail(area: Rect) -> (Rect, Option<Rect>) {
+    if area.width < 90 {
+        return (area, None);
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .split(area);
+    (chunks[0], Some(chunks[1]))
+}
+
+fn kv_line_label(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{}: ", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(value.to_string(), Style::default().fg(Color::White)),
+    ])
+}
+
+fn kv_line_bold(value: &str, color: Color) -> Line<'static> {
+    Line::from(Span::styled(
+        value.to_string(),
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn draw_world_detail(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
+    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
+    let lines: Vec<Line> = match app.worlds_state.selected().and_then(|i| app.worlds.get(i)) {
+        None => vec![Line::from(Span::styled(
+            s.detail_no_selection,
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some(w) => {
+            let when = w
+                .last_modified
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_else(|| "?".into());
+            let yn = |b: bool| if b { s.detail_yes } else { s.detail_no };
+            vec![
+                kv_line_bold(&w.name, Color::Cyan),
+                Line::raw(""),
+                kv_line_label(s.detail_path, &w.path.display().to_string()),
+                kv_line_label(s.detail_size, &fmt_bytes(w.size_bytes)),
+                kv_line_label(s.detail_modified, &when),
+                kv_line_label(s.detail_is_current, yn(w.is_current)),
+                kv_line_label(s.detail_has_level_dat, yn(w.has_level_dat)),
+                kv_line_label(s.detail_playerdata_count, &w.playerdata_count.to_string()),
+            ]
+        }
+    };
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, area);
 }
 
 fn draw_whitelist(f: &mut Frame, area: Rect, app: &mut App) {
+    let (list_area, detail_area) = split_list_detail(area);
     let items: Vec<ListItem> = app
         .whitelist
         .iter()
@@ -1346,10 +1685,50 @@ fn draw_whitelist(f: &mut Frame, area: Rect, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_whitelist))
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut app.whitelist_state);
+    f.render_stateful_widget(list, list_area, &mut app.whitelist_state);
+    if let Some(da) = detail_area {
+        draw_whitelist_detail(f, da, app);
+    }
+}
+
+fn draw_whitelist_detail(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
+    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
+    let lines: Vec<Line> = match app
+        .whitelist_state
+        .selected()
+        .and_then(|i| app.whitelist.get(i))
+    {
+        None => vec![Line::from(Span::styled(
+            s.detail_no_selection,
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some(e) => vec![
+            kv_line_bold(&e.name, Color::Cyan),
+            Line::raw(""),
+            Line::from(Span::styled(
+                format!("{}:", s.detail_uuid),
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(Span::styled(
+                e.uuid.clone(),
+                Style::default().fg(Color::White),
+            )),
+            Line::raw(""),
+            Line::from(Span::styled(
+                s.detail_offline_uuid_note.to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )),
+        ],
+    };
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, area);
 }
 
 fn draw_ops(f: &mut Frame, area: Rect, app: &mut App) {
+    let (list_area, detail_area) = split_list_detail(area);
     let items: Vec<ListItem> = app
         .ops
         .iter()
@@ -1365,11 +1744,57 @@ fn draw_ops(f: &mut Frame, area: Rect, app: &mut App) {
         .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_ops))
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut app.ops_state);
+    f.render_stateful_widget(list, list_area, &mut app.ops_state);
+    if let Some(da) = detail_area {
+        draw_ops_detail(f, da, app);
+    }
+}
+
+fn op_level_meaning(s: &Strings, level: u8) -> &'static str {
+    match level {
+        1 => s.detail_op_level_1,
+        2 => s.detail_op_level_2,
+        3 => s.detail_op_level_3,
+        4 => s.detail_op_level_4,
+        _ => "?",
+    }
+}
+
+fn draw_ops_detail(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
+    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
+    let lines: Vec<Line> = match app.ops_state.selected().and_then(|i| app.ops.get(i)) {
+        None => vec![Line::from(Span::styled(
+            s.detail_no_selection,
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some(e) => {
+            let yn = |b: bool| if b { s.detail_yes } else { s.detail_no };
+            vec![
+                kv_line_bold(&e.name, Color::Cyan),
+                Line::raw(""),
+                Line::from(Span::styled(
+                    format!("{}:", s.detail_uuid),
+                    Style::default().fg(Color::DarkGray),
+                )),
+                Line::from(Span::styled(
+                    e.uuid.clone(),
+                    Style::default().fg(Color::White),
+                )),
+                Line::raw(""),
+                kv_line_label(s.detail_level, &e.level.to_string()),
+                kv_line_label(s.detail_level_meaning, op_level_meaning(s, e.level)),
+                kv_line_label(s.detail_bypass, yn(e.bypasses_player_limit)),
+            ]
+        }
+    };
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, area);
 }
 
 fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
     let lang = app.lang;
+    let (list_area, detail_area) = split_list_detail(area);
     let items: Vec<ListItem> = app
         .properties
         .iter()
@@ -1405,7 +1830,65 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
         )
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut app.config_state);
+    f.render_stateful_widget(list, list_area, &mut app.config_state);
+    if let Some(da) = detail_area {
+        draw_config_detail(f, da, app);
+    }
+}
+
+fn draw_config_detail(f: &mut Frame, area: Rect, app: &App) {
+    let s = app.lang.s();
+    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
+    let lines: Vec<Line> = match app
+        .config_state
+        .selected()
+        .and_then(|i| app.properties.get(i))
+    {
+        None => vec![Line::from(Span::styled(
+            s.detail_no_selection,
+            Style::default().fg(Color::DarkGray),
+        ))],
+        Some((k, v)) => {
+            let mut out = vec![
+                kv_line_label(s.detail_key, k),
+                kv_line_label(s.detail_value, v),
+                Line::raw(""),
+            ];
+            match property_metadata(k) {
+                Some(m) => {
+                    let yn = if m.restart_required { s.detail_yes } else { s.detail_no };
+                    out.push(kv_line_label(s.detail_default, m.default));
+                    out.push(kv_line_label(s.detail_range, m.range));
+                    out.push(kv_line_label(s.detail_restart_required, yn));
+                    out.push(Line::raw(""));
+                    out.push(Line::from(Span::styled(
+                        format!("{}:", s.detail_description),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                    let desc = match app.lang {
+                        Lang::En => m.description_en,
+                        Lang::Zh => m.description_zh,
+                    };
+                    out.push(Line::from(Span::styled(
+                        desc.to_string(),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+                None => {
+                    out.push(Line::raw(""));
+                    out.push(Line::from(Span::styled(
+                        s.detail_no_metadata.to_string(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+            out
+        }
+    };
+    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    f.render_widget(p, area);
 }
 
 fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
@@ -1712,9 +2195,10 @@ fn main() -> Result<()> {
             width,
             height,
             lang,
+            select,
         }) => {
             let server_dir = resolve_server_dir(cli.server_dir.clone())?;
-            return render_screenshot(&server_dir, &tab, width, height, &lang);
+            return render_screenshot(&server_dir, &tab, width, height, &lang, select);
         }
         Some(Cmd::Run) | None => {}
     }
@@ -2527,6 +3011,7 @@ fn render_screenshot(
     width: u16,
     height: u16,
     lang: &str,
+    select: usize,
 ) -> Result<()> {
     use ratatui::backend::TestBackend;
     let lang = Lang::from_code(lang);
@@ -2539,6 +3024,13 @@ fn render_screenshot(
         "logs" => TabId::Logs,
         other => anyhow::bail!("unknown tab: {}", other),
     };
+    // Allow QA to highlight a specific row to inspect its detail panel.
+    let len = app.list_len_for(app.tab);
+    if len > 0 {
+        let idx = select.min(len - 1);
+        let t = app.tab;
+        app.list_state_for(t).select(Some(idx));
+    }
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|f| ui(f, &mut app))?;
@@ -2892,6 +3384,94 @@ Java(TM) SE Runtime Environment ..."#;
         assert!(names.contains(&"snap-1.tar.gz".to_string()));
         assert!(names.contains(&"snap-2.zip".to_string()));
         assert!(!names.contains(&"not-a-backup.txt".to_string()));
+    }
+
+    #[test]
+    fn property_metadata_covers_listed_keys() {
+        for key in [
+            "max-players",
+            "view-distance",
+            "simulation-distance",
+            "difficulty",
+            "gamemode",
+            "pvp",
+            "hardcore",
+            "online-mode",
+            "white-list",
+            "enforce-whitelist",
+            "spawn-protection",
+            "motd",
+            "level-name",
+            "level-type",
+            "level-seed",
+            "server-port",
+            "allow-flight",
+            "allow-nether",
+            "spawn-monsters",
+            "spawn-animals",
+            "enable-rcon",
+            "rcon.password",
+            "rcon.port",
+            "op-permission-level",
+            "function-permission-level",
+            "network-compression-threshold",
+            "max-tick-time",
+            "force-gamemode",
+            "generate-structures",
+            "resource-pack",
+            "require-resource-pack",
+            "player-idle-timeout",
+            "entity-broadcast-range-percentage",
+        ] {
+            let m = property_metadata(key).unwrap_or_else(|| panic!("missing meta for {}", key));
+            assert!(!m.description_en.is_empty(), "empty en desc for {}", key);
+            assert!(!m.description_zh.is_empty(), "empty zh desc for {}", key);
+            assert!(!m.range.is_empty(), "empty range for {}", key);
+        }
+    }
+
+    #[test]
+    fn property_metadata_unknown_returns_none() {
+        assert!(property_metadata("not-a-real-key").is_none());
+    }
+
+    #[test]
+    fn detail_strings_nonempty_in_both_langs() {
+        for s in [&EN, &ZH] {
+            assert!(!s.detail_title.is_empty());
+            assert!(!s.detail_no_selection.is_empty());
+            assert!(!s.detail_no_metadata.is_empty());
+            assert!(!s.detail_path.is_empty());
+            assert!(!s.detail_size.is_empty());
+            assert!(!s.detail_uuid.is_empty());
+            assert!(!s.detail_offline_uuid_note.is_empty());
+            assert!(!s.detail_op_level_4.is_empty());
+            assert!(!s.detail_yes.is_empty());
+            assert!(!s.detail_no.is_empty());
+        }
+    }
+
+    #[test]
+    fn split_list_detail_collapses_on_narrow_screen() {
+        let narrow = Rect { x: 0, y: 0, width: 80, height: 30 };
+        let (list, det) = split_list_detail(narrow);
+        assert_eq!(list, narrow);
+        assert!(det.is_none());
+
+        let wide = Rect { x: 0, y: 0, width: 130, height: 30 };
+        let (list, det) = split_list_detail(wide);
+        assert!(det.is_some());
+        assert!(list.width < wide.width);
+    }
+
+    #[test]
+    fn op_level_meaning_returns_localized_string() {
+        let en = op_level_meaning(&EN, 4);
+        let zh = op_level_meaning(&ZH, 4);
+        assert!(en.contains("/stop") || en.contains("admin"));
+        assert!(zh.contains("/stop") || zh.contains("管理"));
+        assert_ne!(en, zh);
+        assert_eq!(op_level_meaning(&EN, 99), "?");
     }
 
     #[test]
