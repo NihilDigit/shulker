@@ -6,13 +6,19 @@ A small TUI (terminal UI) manager for a local Minecraft Paper / Purpur server.
 
 ## What it does
 
-Manages the boring parts of running a friend-group Minecraft server without leaving the terminal:
+Manages the boring parts of running a friend-group Minecraft server without leaving the terminal. Nine tabs:
 
-- **Worlds** — list every world directory under your server dir, see which is current, switch the active level by writing `level-name` to `server.properties`.
-- **Whitelist** — add / remove players (offline-mode UUID is computed automatically).
-- **Operators** — add / remove ops, change permission level (1–4) without touching JSON by hand.
-- **Config** — browse `server.properties`, edit any value with one keystroke.
-- **Logs** — tail the most recent `logs/latest.log`.
+- **1 Worlds** — list every world directory under your server dir, see which is current, switch the active level by writing `level-name`. `N` creates a new world (writes the new name; the server generates the dir on next start).
+- **2 Whitelist** — add / remove players. Offline-mode UUID is computed automatically (`md5("OfflinePlayer:" + name)`).
+- **3 Ops** — add / remove ops, cycle permission level 1–4 with `←` / `→`. Detail panel explains what each level allows.
+- **4 Config** — browse `server.properties`, edit any value with `Enter`. In Chinese mode each row shows a 中文 annotation; the right-side detail panel shows default + range + restart-required + bilingual description.
+- **5 Logs** — tail `logs/latest.log`.
+- **6 YAML** — pick a Paper/Purpur YAML (`paper-global.yml`, `purpur.yml`, etc.), enter the file, navigate the flattened tree, edit leaf scalars in place.
+- **7 Backups** — list archives in `<server-dir>/backups`, `../backups`, `../mc-backups`, `../<name>-backups`. Newest-first with size + age columns.
+- **8 RCON** — interactive console to a running server (needs `enable-rcon=true` + `rcon.password` in `server.properties`). `i` opens an input prompt.
+- **9 Server (运维)** — restart now, run `backup.sh`, schedule a daily restart / backup as a `systemd --user` timer, pre-generate chunks via RCON to `chunky`, show the `tmux attach` command. The top of this tab also lists every IPv4 interface (ZeroTier first).
+
+Plus an always-visible **join address bar** between the status row and the tab bar — click the chip to copy `<ip>:<port>` to the clipboard via `wl-copy`.
 
 It's intentionally a thin layer over the same files Paper/Purpur already write. Stop using `mc-tui` at any time and your server keeps working.
 
@@ -43,74 +49,131 @@ cargo build --release
 mc-tui --server-dir /path/to/server
 # or via env var
 MC_SERVER_DIR=/path/to/server mc-tui
+# without either, mc-tui falls back to the last server-dir it remembers
+# in $XDG_CONFIG_HOME/mc-tui/state.toml
+mc-tui
 ```
 
 The directory must contain `server.properties`. `whitelist.json` and `ops.json` will be created if missing.
+
+### Subcommands
+
+```bash
+mc-tui new <dir>          # scaffold a fresh server: detect Java, fetch jar, write eula + start.sh
+mc-tui screenshot --tab worlds --lang zh --width 130 --height 32
+                          # render one TUI frame to stdout (used for visual QA)
+```
+
+`mc-tui new` flags: `--server-type paper|purpur` (default purpur), `--mc-version 1.21.4` (default: latest), `--first-boot` (run the server once to generate `server.properties`), `--force` (allow non-empty target dir).
 
 ### Keys
 
 | Key | Action |
 |---|---|
-| `1` … `5` | Jump to tab |
+| `1` … `9` | Jump to tab |
 | `Tab` / `Shift+Tab` | Cycle tabs |
 | `↑` / `↓` | Move selection |
-| `Enter` | Switch world / Edit config value |
+| `Enter` | Switch world / Edit config or YAML value / Run server action / Open YAML file |
+| `Esc` | Cancel prompt; in YAML edit view, return to file picker |
 | `a` | Add (whitelist / op) |
 | `d` | Delete (whitelist / op) |
-| `←` / `→` | Change op level (Ops tab) |
+| `←` / `→` | Cycle op level (Ops tab — wraps 1↔4) |
+| `N` | New world (Worlds tab) |
+| `S` | Start server (spawns `start.sh` in a detached tmux session) |
+| `X` | Stop server (sends `stop` to the tmux console) |
+| `D` | Switch `--server-dir` at runtime |
+| `L` | Toggle 中 / EN |
+| `i` | Send RCON command (RCON tab) |
 | `r` | Refresh from disk |
 | `q` / `Esc` | Quit |
+| Mouse | Click tab bar, list rows, or the join chip (chip → wl-copy) |
 
 When a prompt is open: type the value, `Enter` to confirm, `Esc` to cancel.
 
 ## Behavior contracts (so you can predict what it touches)
 
 - **Worlds tab — switching**: refuses while server is running. Writes `level-name=<chosen>` to `server.properties`. **Drops comments** in `server.properties` (Java properties is quirky and round-tripping comments isn't worth the complexity). Key/value order is preserved.
-- **Whitelist tab — add/remove**: rewrites `whitelist.json` as pretty-printed JSON. UUID for new entries is the offline UUID (`md5("OfflinePlayer:" + name)`, version 3 + RFC 4122 variant bits), the same one vanilla / Paper computes for offline-mode players.
-- **Ops tab — add/remove/level**: rewrites `ops.json`. New ops default to level 4, `bypassesPlayerLimit=false`. Level cycles 1–4.
+- **Worlds tab — N (new)**: refuses while server is running. Validates the name (no `/`, `\`, `.`, `..`). Writes `level-name=<name>` only — the world directory + `level.dat` are generated on next server start. The list shows a placeholder entry for the pending world so you can see the state took.
+- **Whitelist tab — add/remove**: rewrites `whitelist.json` as pretty-printed JSON. UUID for new entries is the offline UUID. **Refuses to write if `whitelist.json` failed to parse on read** (would clobber user's broken-but-recoverable file).
+- **Ops tab — add/remove/level**: rewrites `ops.json`. New ops default to level 4, `bypassesPlayerLimit=false`. Level cycles 1↔4 (←/→ wrap). Same corruption-guard as whitelist.
 - **Config tab — edit**: same `server.properties` write path as Worlds.
 - **Logs tab — read-only**: tails `logs/latest.log`.
+- **YAML tab — edit leaf**: full read → mutate `serde_yaml::Value` → write the file. Keeps key order. Preserves nested structure.
+- **Backups tab**: read-only display; restore is intentionally not automated (do it by hand to avoid surprises).
+- **RCON tab**: sync TCP, packet framing per [wiki.vg/RCON](https://wiki.vg/RCON). Honors `enable-rcon` / `rcon.port` / `rcon.password`; binds to `127.0.0.1` when `server-ip` is empty / `0.0.0.0`.
+- **Server tab — Restart now**: `tmux send-keys stop Enter` → poll for pid disappearance up to 30 s → `tmux new-session` to start.
+- **Server tab — Schedule daily restart/backup**: writes a pair of `~/.config/systemd/user/mc-tui-<kind>-<slug>.{service,timer}` files. mc-tui does **not** run `systemctl --user daemon-reload` for you; the status bar shows the exact command to copy.
 
-mc-tui never starts/stops the server itself. Run your `start.sh` / `systemctl` separately.
+## Server lifecycle
+
+mc-tui starts the server inside a detached tmux session: `tmux new-session -d -s mc-tui-<slug> -c <server-dir> 'bash start.sh'`. Stopping uses `tmux send-keys -t <session> stop Enter` — Minecraft's own console `stop` command, which runs the synchronous shutdown handler on the main thread. **This is the only reliable shutdown path.** Sending SIGTERM to the JVM races with startup and can leave a half-dead process (port closed, world ticking, no progress). If `tmux` is missing, mc-tui falls back to `setsid bash start.sh` for start and SIGTERM for stop.
+
+You can `tmux attach -t mc-tui-<slug>` from another terminal at any time to watch console output or run admin commands directly. The `9 Server` tab has a "show tmux attach command" action that copies the command to the clipboard.
 
 ## Detecting whether the server is running
 
-`server_running_pid()` walks the process list (via `sysinfo`) for any Java process whose argv mentions a `paper`/`purpur`/`spigot` `.jar` and whose CWD is the canonical server dir. If you start the server in an unusual way (Docker, weird wrappers), detection might miss it; the worst case is mc-tui lets you change `level-name` while the server is up — which is bad. PRs welcome to harden this.
+`server_running_pid()` walks the process list (via `sysinfo`) for any Java process whose argv mentions a `paper` / `purpur` / `spigot` jar and whose CWD is the canonical server dir. **It's sticky**: once a pid matches, mc-tui keeps using it across refreshes as long as the process exists and still looks like our server — this stops the status bar from flickering between pids when `cwd` is briefly unreadable. If the previous pid is gone, mc-tui re-scans and picks the lowest matching pid for stability. Multiple matches (e.g. you're running two Minecraft servers from the same dir) is unsupported.
 
 ## Project layout
 
 ```
-src/main.rs    Everything. Single-binary CLI + TUI.
-Cargo.toml     Deps: ratatui, crossterm, clap, serde, serde_json, serde_yaml, md-5, chrono, sysinfo.
-tests/         (none yet — unit tests live in `mod tests` at the bottom of main.rs)
-.github/workflows/release.yml   Tag-triggered release builds.
+src/
+├── main.rs    App state machine, run loop, mouse / event handlers, main(), screenshot subcommand.
+├── cli.rs     Cli + Cmd + ServerType + scaffold_new + Java/curl/Aikar/first-boot helpers.
+├── data.rs    Data structs + filesystem / network IO (worlds, whitelist, ops, properties, backups, YAML walker, RCON client, NIC discovery, sticky pid detection).
+├── i18n.rs    Lang + Strings struct + EN/ZH consts + fmt_* parametric helpers + property_zh annotations + PropertyMeta lookup table.
+├── sys.rs     state.toml persistence, tmux session helpers, POSIX shell quote, path/tilde helpers.
+└── ui.rs      Every ratatui draw_* function + ui() dispatcher + layout helpers.
+
+Cargo.toml     Deps: ratatui, crossterm, clap, serde, serde_json, serde_yaml, md-5, chrono, sysinfo, unicode-width.
+.github/workflows/release.yml   Tag-triggered release builds for 6 targets.
 ```
 
-There's no premature module split. When `main.rs` becomes painful to navigate, split it then, not before.
+Module dependency rule: **ui ← app/main ← {i18n, data, sys, cli}**. UI reads `App` fields (they're `pub`) but never mutates business state — disk writes go through `App::*` methods in `main.rs`. Tests live at the bottom of each module under `#[cfg(test)] mod tests`.
 
 ## Development
 
 ```bash
 cargo run -- --server-dir /path/to/your/server
-cargo test       # unit tests for properties parser, UUID, JSON roundtrip, etc.
+cargo test       # 46 unit tests across all modules
 cargo build --release
 ```
 
+### Visual QA
+
+```bash
+cargo run -- --server-dir /mnt/data/mc-server screenshot \
+    --tab server --lang zh --width 130 --height 32 --select 0 \
+    > /tmp/mc-tui-shot.txt
+```
+
+The `screenshot` subcommand dumps one rendered frame to stdout as plain text using `ratatui::backend::TestBackend`. Each module's `cargo test` block plus a `screenshot` pass for the touched tab is the standard QA flow before committing UI work.
+
 ### Style
 
-- One `main.rs`. Don't introduce `mod foo; mod bar;` until there's a concrete reason. (~700 lines now; ~1500 is still fine in one file for a TUI of this scope.)
+- Multi-module since v0.6. Add a new module when a logical unit grows past ~500 lines or has clear cross-cutting users; otherwise keep it in `main.rs`.
 - No `unsafe`, no `unwrap()` on user-facing paths (use `?` and `anyhow::Context`). `unwrap()` in tests is fine.
 - Errors bubble to `main` via `anyhow::Result`. No `Box<dyn Error>` decay.
-- TUI rendering is pure: `fn ui(f, app)` should not mutate disk. All disk writes go through `App::*` action methods that also update `App::status`.
+- All UI strings route through `Strings` + `EN`/`ZH` consts in `i18n.rs`, or `fmt_<event>(lang, args...)` for parametric ones. Inline `t(lang, "en", "zh")` is allowed for one-off cases but `Strings` is preferred — keep new translations colocated with old.
+- `App` fields are `pub` so `ui.rs` can read them; only `main.rs`'s `impl App` should write them.
 
 ### Tests
 
-Unit tests are at the bottom of `src/main.rs` under `#[cfg(test)] mod tests`. Coverage:
+46 unit tests across:
 
-- Offline UUID: format / version bits / determinism
-- `server.properties` round-trip (read → mutate → write → re-read)
-- `whitelist.json` and `ops.json` round-trip
-- `fmt_bytes` examples
+- Offline UUID format / version bits / determinism (`data.rs`)
+- `server.properties` round-trip (`data.rs`)
+- `whitelist.json` / `ops.json` round-trip + parse-error propagation + corruption guard (`data.rs`, `main.rs`)
+- `scan_worlds` placeholder behavior for pending `level-name` (`data.rs`)
+- Backup file recognition + scan (`data.rs`)
+- RCON settings + packet framing (`data.rs`)
+- YAML flatten / set / scalar parser (`data.rs`)
+- NIC classification + ZeroTier-first ordering (`data.rs`)
+- Java version parser + Aikar flags + Purpur URL builder + heap sizing (`cli.rs`)
+- Lang code roundtrip + property_zh coverage + PropertyMeta coverage + detail strings non-empty + fmt_* helpers (`i18n.rs`)
+- `parse_hh_mm` + `server_dir_slug` + `tmux_session_name` + `shell_quote_sh` + `expand_tilde` + persisted_state roundtrip (`sys.rs`)
+- `split_list_detail` collapse + `op_level_meaning` localization + `fmt_age` + op-level cycle wrap (`ui.rs`, `main.rs`)
+- `rect_contains` (`main.rs`)
 
 If you add a write path to a new file format, add a round-trip test. They're cheap and catch the dumb bugs.
 
@@ -118,49 +181,64 @@ If you add a write path to a new file format, add a round-trip test. They're che
 
 If you're an LLM working on this repo:
 
-1. **Don't extract modules unless asked.** The whole point of single-file is that you can read it top-to-bottom.
+1. **Module boundaries are real now.** Adding to `i18n.rs`? Use the `Strings` + EN/ZH pattern. Adding a new tab? UI render goes in `ui.rs`, App state in `main.rs`, persistence in `sys.rs` or `data.rs`. Don't dump everything in `main.rs`.
 2. **Don't add features the user didn't ask for.** No "while we're here" cleanups, no extra tabs, no daemons that watch the server. Keep PRs scoped.
-3. **Run `cargo test` before claiming done.** UI changes need manual QA — say so explicitly when you can't verify visually.
+3. **Run `cargo test` before claiming done.** UI changes need manual QA — render a screenshot via the `screenshot` subcommand and inspect it. Say so explicitly when you can't verify visually.
 4. **Don't hardcode paths or user-specific values.** The whole CLI is parameterized via `--server-dir` for a reason; preserve that.
-5. **Never commit binaries, lockfiles for libraries** (we DO commit `Cargo.lock` since this is a binary crate), `target/`, or anything under `~/.minecraft`.
-
-When you propose changes, use the same anyhow-everywhere, single-file convention. If a function gets > 80 lines, that's a fine signal it might want to be extracted — but talk to the human first.
+5. **Never commit binaries**, `target/`, `~/.minecraft`, or anything under user server dirs. We DO commit `Cargo.lock` since this is a binary crate.
+6. **`tmux` is the start/stop path.** Don't add SIGTERM as a primary mechanism — we tried, it raced with Paper's startup and left half-dead processes. tmux + console `stop` is what works.
+7. **App fields are pub for `ui.rs`, not for free editing.** Keep mutation paths funneled through `impl App` methods so they can update `App::status` and run `refresh_all()` consistently.
 
 ## Roadmap
 
-Tracked here instead of GitHub issues for now (low overhead). Add to top of list, mark with date when shipped.
+Tracked here instead of GitHub issues for now. Mark with date when shipped; keep oldest at the bottom.
 
-### v0.2 — interactivity
+### v0.2 — interactivity (shipped 2026-05-01)
 
-- [ ] **Server lifecycle from TUI**: `S` to start (spawns `start.sh`), `X` to stop (SIGTERM the detected pid + wait for graceful shutdown). Status bar shows progress.
-- [ ] **Create new world**: `N` in Worlds tab → prompt for name → write `level-name=<name>` so next start generates a fresh world.
-- [ ] **Mouse support**: `EnableMouseCapture` is already on; wire click handlers for tab bar + list rows.
-- [ ] **Server-dir switcher**: `D` to open prompt for a new server-dir, validate (must contain `server.properties`), reload all state.
-- [ ] **Persist last-good server-dir**: write `$XDG_CONFIG_HOME/mc-tui/state.toml`. Without `--server-dir`, restore from there. If no remembered dir and no `--server-dir`, error out clearly.
+- [x] **Server lifecycle from TUI**: `S` to start (tmux session), `X` to stop (tmux send-keys `stop`).
+- [x] **Create new world**: `N` in Worlds tab → prompt → write `level-name`. Placeholder shown in list until generated.
+- [x] **Mouse support**: tab bar clicks, list row clicks, join-bar chip clicks.
+- [x] **Server-dir switcher**: `D` opens a prompt; validates `server.properties` exists.
+- [x] **Persist last-good server-dir** in `$XDG_CONFIG_HOME/mc-tui/state.toml`.
 
-### v0.3 — i18n
+### v0.3 — i18n (shipped 2026-05-01)
 
-- [ ] Add `Lang` enum (`En`, `Zh`). Toggle with `L`. Translate UI strings, hint bar, prompt labels, status messages.
-- [ ] Translate common `server.properties` keys into Chinese annotations in the Config tab (`max-players` → `最大玩家数`, `view-distance` → `视距`, etc.). Keep raw key visible — translation is annotation, not replacement.
+- [x] `Lang::{En, Zh}` enum, `L` toggles, persisted across runs.
+- [x] All UI strings, hint bar, prompt labels, status messages route through `Strings` + EN/ZH consts.
+- [x] Common `server.properties` keys get a Chinese annotation in the Config tab; raw key still visible.
 
-### v0.4 — server scaffolder
+### v0.4 — server scaffolder (shipped 2026-05-01)
 
-- [ ] Wizard for `mc-tui new <dir>`:
-  - Check Java ≥ 25 in `$PATH` (parse `java -version`). Error if missing/too old.
-  - Pick MC version + server type (Paper / Purpur) via Modrinth/Purpur API.
-  - Download jar, write `eula.txt`, write `start.sh` with Aikar's flags + heap based on detected RAM.
-  - Optionally first-boot to generate `server.properties`, then stop.
-- [ ] Refuse to scaffold into a non-empty dir without `--force`.
+- [x] `mc-tui new <dir>`: Java check, version resolution via Paper / Purpur APIs, jar download via `curl`, `eula.txt` + `start.sh` (Aikar's flags + RAM-aware heap), optional `--first-boot`.
+- [x] Refuses non-empty target without `--force`.
 
-### v0.5 — beyond
+### v0.5 — beyond (shipped 2026-05-01)
 
-- [ ] Edit `paper-global.yml` / `paper-world-defaults.yml` / `purpur.yml` (huge YAMLs, needs nested editor).
-- [ ] Backup tab — list `/path/to/backups/`, restore with confirmation.
-- [ ] RCON bridge — send commands to running server without attaching to console.
+- [x] Edit `paper-global.yml` / `paper-world-defaults.yml` / `purpur.yml` (file picker → flat row editor).
+- [x] Backup tab — list archives in candidate directories, sorted newest-first.
+- [x] RCON bridge — `i` to send a command, history pane.
+- [x] Hover-detail panels for Worlds / Whitelist / Ops / Config (lists split 70/30, right side describes the selection).
 
-### v0.6+ — stability gate
+### v0.6 — server ops (shipped 2026-05-01)
 
-The CI workflow at `.github/workflows/release.yml` is already in place but **no tag has been pushed yet**. First release (binary publish) is intentionally held until the project hits a stable version (~v0.6). To cut a release: `git tag v0.6.0 && git push --tags` — that triggers builds for the 6 targets and uploads to GitHub Releases.
+- [x] Restart-now action.
+- [x] Run-`backup.sh`-now action.
+- [x] Schedule daily restart / backup via `systemd --user` timer.
+- [x] Pre-generate chunks via RCON to `chunky`.
+- [x] Always-visible join-address bar (ZeroTier-aware) + click-to-copy.
+- [x] `tmux attach` command exposed as a Server-tab action.
+
+### v0.7+ — release prep
+
+- [ ] Tag `v0.7.0` and let `.github/workflows/release.yml` build binaries for all 6 targets.
+- [ ] Write `scripts/install.sh` + `scripts/install.ps1` (curl / irm one-liners that detect platform, hit the GH releases API, drop the binary in `~/.local/bin`).
+- [ ] README install one-liner pointing at `https://github.com/<USER>/mc-tui/releases/latest/download/install.sh`.
+
+### Backlog (no version yet)
+
+- [ ] Backup restore action (with confirmation prompt + extract into a sibling dir, never overwrite the live world).
+- [ ] First-class i18n for plugin-specific RCON command sets.
+- [ ] More YAML schema awareness for `paper-global.yml` (right-side panel showing what each key does, mirrored from upstream docs).
 
 ## License
 
