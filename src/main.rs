@@ -517,6 +517,10 @@ struct Strings {
     server_systemd_unit_dir: &'static str,
     server_systemd_unit_dir_hint: &'static str,
     server_pregen_no_running: &'static str,
+    join_section_title: &'static str,
+    join_no_interfaces: &'static str,
+    join_port_label: &'static str,
+    server_actions_section: &'static str,
 }
 
 const EN: Strings = Strings {
@@ -621,6 +625,10 @@ const EN: Strings = Strings {
     server_systemd_unit_dir: "systemd user units",
     server_systemd_unit_dir_hint: "Run: systemctl --user daemon-reload && systemctl --user enable --now <name>.timer",
     server_pregen_no_running: "✗ Server is not running — RCON requires a running server.",
+    join_section_title: " Join addresses (port from server.properties) ",
+    join_no_interfaces: "(no IPv4 interfaces detected — is `ip` in PATH?)",
+    join_port_label: "port",
+    server_actions_section: " Actions ",
 };
 
 const ZH: Strings = Strings {
@@ -725,6 +733,10 @@ const ZH: Strings = Strings {
     server_systemd_unit_dir: "systemd 用户 unit",
     server_systemd_unit_dir_hint: "执行: systemctl --user daemon-reload && systemctl --user enable --now <name>.timer",
     server_pregen_no_running: "✗ 服务器未运行 — RCON 需要服务器在运行。",
+    join_section_title: " 连接地址（端口取自 server.properties）",
+    join_no_interfaces: "(没检测到 IPv4 接口 — `ip` 命令在 PATH 里吗？)",
+    join_port_label: "端口",
+    server_actions_section: " 操作 ",
 };
 
 // Parametric messages — return owned Strings.
@@ -2821,21 +2833,90 @@ fn draw_rcon(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_server(f: &mut Frame, area: Rect, app: &mut App) {
+    // Vertical split: top = join info (auto-sized to # of interfaces, capped), bottom = actions list.
+    let nics = detect_interfaces();
+    let join_h = (nics.len() as u16 + 2).max(3).min(12); // border(2) + lines, cap 12
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(join_h), Constraint::Min(3)])
+        .split(area);
+
+    draw_join_info(f, chunks[0], app, &nics);
+    draw_server_actions(f, chunks[1], app);
+}
+
+fn draw_join_info(f: &mut Frame, area: Rect, app: &App, nics: &[NicInfo]) {
+    let s = app.lang.s();
+    let port: u16 = get_property(&app.properties, "server-port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25565);
+
+    let lines: Vec<Line> = if nics.is_empty() {
+        vec![Line::from(Span::styled(
+            s.join_no_interfaces,
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        nics.iter()
+            .map(|n| {
+                Line::from(vec![
+                    Span::raw(" "),
+                    Span::styled(
+                        format!("{:14}", n.name),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{}:{}", n.ip, port),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("[{}]", nic_kind_label(app.lang, n.kind)),
+                        Style::default().fg(nic_kind_color(n.kind)),
+                    ),
+                ])
+            })
+            .collect()
+    };
+
+    let p = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(s.join_section_title),
+        )
+        .wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+fn draw_server_actions(f: &mut Frame, area: Rect, app: &mut App) {
     let s = app.lang.s();
     let items: Vec<ListItem> = SERVER_ACTIONS
         .iter()
         .map(|a| {
             ListItem::new(Line::from(vec![
                 Span::raw(" "),
-                Span::styled(server_action_label(app.lang, *a), Style::default().fg(Color::White)),
+                Span::styled(
+                    server_action_label(app.lang, *a),
+                    Style::default().fg(Color::White),
+                ),
             ]))
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(s.title_server))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(s.server_actions_section),
+        )
         .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut app.server_state);
+    // Note: title_server (s.title_server) is intentionally not rendered as a
+    // border title here — Server tab uses two stacked blocks ("Join addresses"
+    // + "Actions") and the tab name in the tab bar already conveys context.
+    let _ = s.title_server;
 }
 
 fn draw_hints(f: &mut Frame, area: Rect, app: &App) {
@@ -3661,6 +3742,130 @@ fn first_boot_run(dir: &Path, jar: &str, heap_mb: u32) -> Result<()> {
     Ok(())
 }
 
+// ---------- v0.6: network interface discovery (Server tab join info) ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NicKind {
+    Loopback,
+    Zerotier,
+    Lan,
+    Public,
+    Tun,
+    Docker,
+}
+
+#[derive(Debug, Clone)]
+struct NicInfo {
+    name: String,
+    ip: std::net::Ipv4Addr,
+    kind: NicKind,
+}
+
+/// Heuristic classifier. Prefers interface naming convention over IP-range
+/// guessing (since CGNAT can give 10.x to a Wi-Fi card and ZT can route
+/// non-private ranges). IP range only decides Lan vs Public.
+fn classify_iface(name: &str, ip: &std::net::Ipv4Addr) -> NicKind {
+    if ip.is_loopback() {
+        return NicKind::Loopback;
+    }
+    let lower = name.to_ascii_lowercase();
+    if lower.starts_with("zt") || lower.starts_with("zerotier") {
+        return NicKind::Zerotier;
+    }
+    if lower.starts_with("docker") || lower.starts_with("br-") || lower.starts_with("veth") {
+        return NicKind::Docker;
+    }
+    if lower.starts_with("tun")
+        || lower.starts_with("tap")
+        || lower.starts_with("wg")
+        || lower.starts_with("tailscale")
+        || lower == "mihomo"
+        || lower == "utun"
+    {
+        return NicKind::Tun;
+    }
+    let o = ip.octets();
+    let private = o[0] == 10
+        || (o[0] == 172 && (16..=31).contains(&o[1]))
+        || (o[0] == 192 && o[1] == 168)
+        || (o[0] == 169 && o[1] == 254); // link-local
+    if private {
+        NicKind::Lan
+    } else {
+        NicKind::Public
+    }
+}
+
+/// Sort key — lower = shown first. Friend-group-server priority:
+/// ZeroTier first (this is what we tell friends), then LAN, then Public.
+fn nic_kind_priority(k: NicKind) -> u8 {
+    match k {
+        NicKind::Zerotier => 0,
+        NicKind::Lan => 1,
+        NicKind::Public => 2,
+        NicKind::Tun => 3,
+        NicKind::Docker => 4,
+        NicKind::Loopback => 5,
+    }
+}
+
+fn nic_kind_label(lang: Lang, k: NicKind) -> &'static str {
+    match (lang, k) {
+        (Lang::En, NicKind::Zerotier) => "ZeroTier",
+        (Lang::En, NicKind::Lan) => "LAN",
+        (Lang::En, NicKind::Public) => "Public",
+        (Lang::En, NicKind::Tun) => "VPN/TUN",
+        (Lang::En, NicKind::Docker) => "Docker",
+        (Lang::En, NicKind::Loopback) => "Loopback",
+        (Lang::Zh, NicKind::Zerotier) => "ZeroTier",
+        (Lang::Zh, NicKind::Lan) => "局域网",
+        (Lang::Zh, NicKind::Public) => "公网",
+        (Lang::Zh, NicKind::Tun) => "VPN/TUN",
+        (Lang::Zh, NicKind::Docker) => "Docker",
+        (Lang::Zh, NicKind::Loopback) => "本机",
+    }
+}
+
+fn nic_kind_color(k: NicKind) -> Color {
+    match k {
+        NicKind::Zerotier => Color::Magenta,
+        NicKind::Lan => Color::Green,
+        NicKind::Public => Color::Yellow,
+        NicKind::Tun => Color::Cyan,
+        NicKind::Docker => Color::DarkGray,
+        NicKind::Loopback => Color::DarkGray,
+    }
+}
+
+/// Parse `ip -4 -o addr show` output. Each non-secondary line looks like:
+///   `3: wlan0    inet 10.128.177.76/11 brd ... scope global ...`
+/// We pull out interface name and IP, classify, and return.
+fn detect_interfaces() -> Vec<NicInfo> {
+    use std::process::Command;
+    let out = Command::new("ip")
+        .args(["-4", "-o", "addr", "show"])
+        .output();
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    for line in text.lines() {
+        let toks: Vec<&str> = line.split_whitespace().collect();
+        if toks.len() < 4 || toks[2] != "inet" {
+            continue;
+        }
+        let name = toks[1].trim_end_matches(':').to_string();
+        let Some(ip_part) = toks[3].split('/').next() else { continue };
+        let Ok(ip) = ip_part.parse::<std::net::Ipv4Addr>() else { continue };
+        let kind = classify_iface(&name, &ip);
+        result.push(NicInfo { name, ip, kind });
+    }
+    result.sort_by_key(|n| (nic_kind_priority(n.kind), n.name.clone()));
+    result
+}
+
 // ---------- v0.5: backup scanner ----------
 //
 // Look for archive files in standard backup locations and present them as a
@@ -4481,6 +4686,84 @@ Java(TM) SE Runtime Environment ..."#;
         assert!(parse_hh_mm("12:60").is_none());
         assert!(parse_hh_mm("nope").is_none());
         assert!(parse_hh_mm("12").is_none());
+    }
+
+    #[test]
+    fn classify_iface_handles_known_naming_conventions() {
+        use std::net::Ipv4Addr;
+        // ZeroTier — name prefix wins regardless of IP range
+        assert_eq!(
+            classify_iface("ztpp6kuvag", &Ipv4Addr::new(10, 24, 0, 11)),
+            NicKind::Zerotier
+        );
+        assert_eq!(
+            classify_iface("zerotier0", &Ipv4Addr::new(192, 168, 1, 5)),
+            NicKind::Zerotier
+        );
+        // Loopback — IP wins
+        assert_eq!(
+            classify_iface("lo", &Ipv4Addr::new(127, 0, 0, 1)),
+            NicKind::Loopback
+        );
+        // Docker / bridges
+        assert_eq!(
+            classify_iface("docker0", &Ipv4Addr::new(172, 17, 0, 1)),
+            NicKind::Docker
+        );
+        assert_eq!(
+            classify_iface("br-8115d8db670a", &Ipv4Addr::new(172, 18, 0, 1)),
+            NicKind::Docker
+        );
+        // VPN/TUN
+        assert_eq!(
+            classify_iface("mihomo", &Ipv4Addr::new(198, 18, 0, 1)),
+            NicKind::Tun
+        );
+        assert_eq!(
+            classify_iface("tun0", &Ipv4Addr::new(10, 8, 0, 1)),
+            NicKind::Tun
+        );
+        assert_eq!(
+            classify_iface("wg0", &Ipv4Addr::new(10, 100, 0, 1)),
+            NicKind::Tun
+        );
+        // LAN — RFC1918
+        assert_eq!(
+            classify_iface("wlan0", &Ipv4Addr::new(192, 168, 1, 50)),
+            NicKind::Lan
+        );
+        assert_eq!(
+            classify_iface("wlan0", &Ipv4Addr::new(10, 128, 177, 76)),
+            NicKind::Lan
+        );
+        // Public
+        assert_eq!(
+            classify_iface("eth0", &Ipv4Addr::new(8, 8, 8, 8)),
+            NicKind::Public
+        );
+    }
+
+    #[test]
+    fn nic_kind_priority_orders_zerotier_first() {
+        assert!(nic_kind_priority(NicKind::Zerotier) < nic_kind_priority(NicKind::Lan));
+        assert!(nic_kind_priority(NicKind::Lan) < nic_kind_priority(NicKind::Public));
+        assert!(nic_kind_priority(NicKind::Public) < nic_kind_priority(NicKind::Tun));
+        assert!(nic_kind_priority(NicKind::Docker) < nic_kind_priority(NicKind::Loopback));
+    }
+
+    #[test]
+    fn nic_kind_label_localized() {
+        for k in [
+            NicKind::Zerotier,
+            NicKind::Lan,
+            NicKind::Public,
+            NicKind::Tun,
+            NicKind::Docker,
+            NicKind::Loopback,
+        ] {
+            assert!(!nic_kind_label(Lang::En, k).is_empty());
+            assert!(!nic_kind_label(Lang::Zh, k).is_empty());
+        }
     }
 
     #[test]
