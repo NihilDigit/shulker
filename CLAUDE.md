@@ -24,20 +24,32 @@ It's intentionally a thin layer over the same files Paper/Purpur already write. 
 
 ## Install
 
-### Pre-built binaries
+### One-line install (recommended)
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/NihilDigit/mc-tui/main/scripts/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/NihilDigit/mc-tui/main/scripts/install.ps1 | iex
+```
+
+The script detects your platform, fetches the latest release, and drops `mc-tui` into `~/.local/bin` (Linux/macOS) or `%LOCALAPPDATA%\mc-tui` (Windows). Override the install dir with `MC_TUI_INSTALL_DIR=...`; pin a version with `MC_TUI_VERSION=v0.7.0`.
+
+### Pre-built binaries (manual)
 
 GitHub Releases ship binaries for Linux / macOS / Windows on x86_64 and aarch64. Download the archive for your platform, extract, run.
 
 ### From source
 
 ```bash
-cargo install --git https://github.com/<USER>/mc-tui
+cargo install --git https://github.com/NihilDigit/mc-tui
 ```
 
 Or clone and build:
 
 ```bash
-git clone https://github.com/<USER>/mc-tui
+git clone https://github.com/NihilDigit/mc-tui
 cd mc-tui
 cargo build --release
 ./target/release/mc-tui --server-dir /path/to/your/server
@@ -228,11 +240,11 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] Always-visible join-address bar (ZeroTier-aware) + click-to-copy.
 - [x] `tmux attach` command exposed as a Server-tab action.
 
-### v0.7+ — release prep
+### v0.7 — release (pending tag push)
 
-- [ ] Tag `v0.7.0` and let `.github/workflows/release.yml` build binaries for all 6 targets.
-- [ ] Write `scripts/install.sh` + `scripts/install.ps1` (curl / irm one-liners that detect platform, hit the GH releases API, drop the binary in `~/.local/bin`).
-- [ ] README install one-liner pointing at `https://github.com/<USER>/mc-tui/releases/latest/download/install.sh`.
+- [x] `scripts/install.sh` + `scripts/install.ps1`: platform-detect, GH-API tag resolve, extract to `~/.local/bin` (or `%LOCALAPPDATA%\mc-tui`). Honors `MC_TUI_INSTALL_DIR` and `MC_TUI_VERSION`.
+- [x] README one-liner pointing at the raw scripts on the `main` branch.
+- [ ] **`git tag v0.7.0 && git push --tags`** — triggers `.github/workflows/release.yml`, which builds 6 archives and creates the GH release. Run this when you're ready; mc-tui doesn't auto-push.
 
 ### Backlog (no version yet)
 
