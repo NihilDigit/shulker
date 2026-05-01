@@ -628,9 +628,11 @@ pub fn fmt_age(d: chrono::Duration) -> String {
 }
 
 fn draw_server(f: &mut Frame, area: Rect, app: &mut App) {
-    // Vertical split: top = join info (auto-sized to # of interfaces, capped), bottom = actions list.
+    // Vertical split: top = join info (auto-sized to # of interfaces + optional
+    // SakuraFrp row, capped), bottom = actions list.
     let nics = detect_interfaces();
-    let join_h = (nics.len() as u16 + 2).max(3).min(12); // border(2) + lines, cap 12
+    let frp_extra: u16 = if app.sakurafrp_address.is_some() { 1 } else { 0 };
+    let join_h = (nics.len() as u16 + frp_extra + 2).max(3).min(13); // border(2) + lines
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(join_h), Constraint::Min(3)])
@@ -640,13 +642,14 @@ fn draw_server(f: &mut Frame, area: Rect, app: &mut App) {
     draw_server_actions(f, chunks[1], app);
 }
 
-fn draw_join_info(f: &mut Frame, area: Rect, app: &App, nics: &[NicInfo]) {
+fn draw_join_info(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
+    use unicode_width::UnicodeWidthStr;
     let s = app.lang.s();
     let port: u16 = get_property(&app.properties, "server-port")
         .and_then(|v| v.parse().ok())
         .unwrap_or(25565);
 
-    let lines: Vec<Line> = if nics.is_empty() {
+    let mut lines: Vec<Line> = if nics.is_empty() {
         vec![Line::from(Span::styled(
             s.join_no_interfaces,
             Style::default().fg(Color::DarkGray),
@@ -674,6 +677,53 @@ fn draw_join_info(f: &mut Frame, area: Rect, app: &App, nics: &[NicInfo]) {
             })
             .collect()
     };
+
+    // Optional SakuraFrp row. The user-set address is the literal string they
+    // need to share — already includes port (e.g. `cn-sh.frp.one:23456`)
+    // because frp tunnels remap the local 25565 to whatever port the provider
+    // assigned, not server.properties' server-port. Click → wl-copy.
+    if let Some(addr) = app.sakurafrp_address.clone() {
+        let name_span = Span::styled(
+            format!("{:14}", "frp"),
+            Style::default().fg(Color::White),
+        );
+        let chip_text = addr.clone();
+        let addr_span = Span::styled(
+            chip_text.clone(),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        let kind_span = Span::styled(
+            format!("[{}]", s.frp_label),
+            Style::default().fg(Color::Magenta),
+        );
+
+        // Compute chip rect for click-to-copy. Account for the block's 1-char
+        // top border and the leading space + name column.
+        let line_y = area.y + 1 + lines.len() as u16;
+        let prefix_width = 1u16/*border*/ + 1u16/*leading space*/
+            + UnicodeWidthStr::width(name_span.content.as_ref()) as u16
+            + 2u16 /*"  "*/;
+        let chip_rect = Rect {
+            x: area.x + prefix_width,
+            y: line_y,
+            width: UnicodeWidthStr::width(chip_text.as_str()) as u16,
+            height: 1,
+        };
+        if chip_rect.y < area.y + area.height {
+            app.join_chips.push((chip_rect, chip_text));
+        }
+
+        lines.push(Line::from(vec![
+            Span::raw(" "),
+            name_span,
+            Span::raw("  "),
+            addr_span,
+            Span::raw("  "),
+            kind_span,
+        ]));
+    }
 
     let p = Paragraph::new(lines)
         .block(

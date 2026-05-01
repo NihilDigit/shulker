@@ -77,6 +77,10 @@ enum ServerAction {
     PreGenChunks,
     OpenSystemdStatus,
     ShowAttachCommand,
+    // v0.8 — surface the SakuraFrp tunnel address in the join-bar. mc-tui
+    // doesn't manage frpc itself (the SakuraFrp client does that); we just
+    // show the host:port the user shares with friends.
+    SetSakuraFrpAddress,
 }
 
 const SERVER_ACTIONS: &[ServerAction] = &[
@@ -87,6 +91,7 @@ const SERVER_ACTIONS: &[ServerAction] = &[
     ServerAction::ScheduleDailyBackup,
     ServerAction::PreGenChunks,
     ServerAction::OpenSystemdStatus,
+    ServerAction::SetSakuraFrpAddress,
 ];
 
 /// YAML tab toggles between file picker and a flat row editor for one file.
@@ -115,6 +120,7 @@ enum PromptAction {
     ScheduleDailyRestart,
     ScheduleDailyBackup,
     PreGenChunkRadius,
+    SetSakuraFrpAddress,
 }
 
 struct App {
@@ -151,6 +157,10 @@ struct App {
 
     // v0.6 — Server ops
     pub server_state: ListState,
+
+    // v0.8 — SakuraFrp tunnel public address (display-only). Persisted in
+    // state.toml. The actual frpc service is managed by the SakuraFrp client.
+    pub sakurafrp_address: Option<String>,
 
     pub status: String,
     pub prompt: Option<InputPrompt>,
@@ -195,6 +205,9 @@ impl App {
             backups: Vec::new(),
             backups_state: ListState::default(),
             server_state: ListState::default(),
+            // Pull persisted SakuraFrp address so the join-bar shows the
+            // public entry from the start of the session.
+            sakurafrp_address: read_persisted_state().sakurafrp_address,
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -738,6 +751,30 @@ impl App {
         };
     }
 
+    // ---- v0.8: SakuraFrp helpers ----
+
+    fn set_sakurafrp_address(&mut self, value: &str) -> Result<()> {
+        let trimmed = value.trim();
+        let mut state = read_persisted_state();
+        if trimmed.is_empty() {
+            self.sakurafrp_address = None;
+            state.sakurafrp_address = None;
+            self.status = match self.lang {
+                Lang::En => "✓ Cleared SakuraFrp address.".into(),
+                Lang::Zh => "✓ 已清除 SakuraFrp 地址。".into(),
+            };
+        } else {
+            self.sakurafrp_address = Some(trimmed.to_string());
+            state.sakurafrp_address = Some(trimmed.to_string());
+            self.status = match self.lang {
+                Lang::En => format!("✓ SakuraFrp address set: {}", trimmed),
+                Lang::Zh => format!("✓ SakuraFrp 地址已保存：{}", trimmed),
+            };
+        }
+        let _ = write_persisted_state(&state);
+        Ok(())
+    }
+
     fn show_systemd_status(&mut self) {
         let unit_dir = config_dir().parent().unwrap_or(Path::new(".")).join("systemd").join("user");
         self.status = match self.lang {
@@ -1079,6 +1116,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                             app.schedule_daily(ServerAction::ScheduleDailyBackup, &value)?
                         }
                         PromptAction::PreGenChunkRadius => app.pregen_chunks(&value)?,
+                        PromptAction::SetSakuraFrpAddress => app.set_sakurafrp_address(&value)?,
                     }
                 }
                 KeyCode::Backspace => {
@@ -1285,6 +1323,15 @@ fn handle_server_action(app: &mut App, a: ServerAction) -> Result<()> {
         }
         ServerAction::ShowAttachCommand => {
             app.show_attach_command();
+            Ok(())
+        }
+        ServerAction::SetSakuraFrpAddress => {
+            app.prompt = Some(InputPrompt {
+                title: s.frp_prompt_address_title.into(),
+                label: s.frp_prompt_address_label.into(),
+                buffer: app.sakurafrp_address.clone().unwrap_or_default(),
+                action: PromptAction::SetSakuraFrpAddress,
+            });
             Ok(())
         }
     }
@@ -1619,13 +1666,17 @@ mod tests {
         // Write directly so we exercise the parser.
         fs::write(
             &state_file,
-            "# header\nserver_dir = \"/srv/mc\"\nlang = \"zh\"\n",
+            "# header\n\
+             server_dir = \"/srv/mc\"\n\
+             lang = \"zh\"\n\
+             sakurafrp_address = \"cn-sh-bgp.frp.one:23456\"\n",
         )
         .unwrap();
         // Reuse parser via a tiny shim that mimics read_persisted_state but takes a path.
         let raw = fs::read_to_string(&state_file).unwrap();
         let mut server_dir: Option<PathBuf> = None;
         let mut lang: Option<String> = None;
+        let mut sakurafrp_address: Option<String> = None;
         for line in raw.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -1637,12 +1688,14 @@ mod tests {
                 match k {
                     "server_dir" => server_dir = Some(PathBuf::from(v)),
                     "lang" => lang = Some(v),
+                    "sakurafrp_address" => sakurafrp_address = Some(v),
                     _ => {}
                 }
             }
         }
         assert_eq!(server_dir, Some(PathBuf::from("/srv/mc")));
         assert_eq!(lang.as_deref(), Some("zh"));
+        assert_eq!(sakurafrp_address.as_deref(), Some("cn-sh-bgp.frp.one:23456"));
     }
 
     #[test]
