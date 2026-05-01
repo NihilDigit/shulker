@@ -3548,6 +3548,7 @@ mod tests {
         assert_eq!(((3i16 - 1 + -1).rem_euclid(4) + 1) as u8, 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_quote_sh_handles_dangerous_characters() {
         // safe → unquoted

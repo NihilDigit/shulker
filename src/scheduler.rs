@@ -287,12 +287,16 @@ mod macos {
             .replace('\'', "&apos;")
     }
 
-    /// libc::getuid() — pulling the libc crate just for this is overkill;
-    /// extern via std's fallback link group instead.
-    extern "C" {
+    // libc::getuid() — pulling the libc crate just for this is overkill;
+    // extern via std's fallback link group instead. Rust 2024 edition
+    // requires the extern block itself be marked unsafe; the wrapper is
+    // a safe one-liner so callers don't need their own unsafe block.
+    unsafe extern "C" {
         fn getuid() -> u32;
     }
-    unsafe fn libc_getuid() -> u32 { getuid() }
+    fn libc_getuid() -> u32 {
+        unsafe { getuid() }
+    }
 }
 
 // ---------- Windows: schtasks ----------
