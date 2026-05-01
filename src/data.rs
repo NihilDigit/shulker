@@ -794,6 +794,87 @@ pub struct SakuraFrpDocker {
     pub state: DockerState,
 }
 
+/// v0.15.1 — Download a binary from `url` to `target` and chmod it 0755.
+/// Streams the response so we don't materialize a 5+ MB blob in RAM. Caller
+/// is responsible for ensuring the target directory exists.
+///
+/// Note: this is a synchronous blocking call (~5–10 s on a fast link). It's
+/// invoked from the setup wizard, which runs on the main thread; we don't
+/// have an async runtime, and adding one for one-shot downloads isn't worth
+/// the complexity.
+pub fn download_frpc(url: &str, target: &Path) -> Result<()> {
+    use std::io::Write;
+    use std::time::Duration;
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(60))
+        .build();
+    let resp = agent
+        .get(url)
+        .call()
+        .with_context(|| format!("GET {}", url))?;
+    let mut reader = resp.into_reader();
+    let mut tmp = target.to_path_buf();
+    tmp.set_extension("download");
+    let mut f = fs::File::create(&tmp)
+        .with_context(|| format!("create {}", tmp.display()))?;
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = std::io::Read::read(&mut reader, &mut buf)
+            .with_context(|| "read frpc body")?;
+        if n == 0 {
+            break;
+        }
+        f.write_all(&buf[..n])
+            .with_context(|| format!("write {}", tmp.display()))?;
+    }
+    f.sync_all().ok();
+    drop(f);
+    // Atomic-ish move: rename only after the full body is on disk so a
+    // partial download never gets chmod'd to executable.
+    fs::rename(&tmp, target)
+        .with_context(|| format!("rename {} → {}", tmp.display(), target.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(target)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(target, perms)?;
+    }
+    Ok(())
+}
+
+/// v0.15.1 — MD5 a file on disk and compare to `expected` (lowercase hex).
+/// Reads in 64 KiB chunks so a multi-MB binary doesn't bloat memory. Used by
+/// the setup wizard to confirm the downloaded frpc matches the manifest.
+pub fn verify_md5(path: &Path, expected: &str) -> Result<bool> {
+    let computed = md5_file(path)?;
+    Ok(computed.eq_ignore_ascii_case(expected))
+}
+
+fn md5_file(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut f = fs::File::open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = Md5::new();
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let bytes: [u8; 16] = hasher.finalize().into();
+    let mut hex = String::with_capacity(32);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut hex, "{:02x}", b);
+    }
+    Ok(hex)
+}
+
 /// v0.15 — Locate a usable frpc binary. Search order:
 ///   1. `frpc` on `$PATH` (Arch users via `paru -S sakura-frp`, Homebrew, etc.)
 ///   2. `~/.config/mc-tui/frpc` (where mc-tui's onboarding tells users to drop it)
@@ -1408,6 +1489,34 @@ mod tests {
         assert_eq!(parse_launcher_password(r#"{"password":""}"#), None);
         assert_eq!(parse_launcher_password(r#"{"foo":"bar"}"#), None);
         assert_eq!(parse_launcher_password("nope"), None);
+    }
+
+    /// v0.15.1 — md5 round-trip against a known-good fixture. The setup
+    /// wizard relies on this to confirm a downloaded frpc matches the
+    /// manifest; a regression here means the wizard might silently accept
+    /// a corrupted binary.
+    #[test]
+    fn verify_md5_against_known_vector() {
+        // RFC 1321: md5("") = d41d8cd98f00b204e9800998ecf8427e
+        let dir = std::env::temp_dir().join(format!(
+            "mc-tui-md5-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("empty.bin");
+        fs::write(&path, b"").unwrap();
+        assert!(verify_md5(&path, "d41d8cd98f00b204e9800998ecf8427e").unwrap());
+        assert!(!verify_md5(&path, "00000000000000000000000000000000").unwrap());
+        // Non-empty: md5("abc") = 900150983cd24fb0d6963f7d28e17f72
+        let path2 = dir.join("abc.bin");
+        fs::write(&path2, b"abc").unwrap();
+        assert!(verify_md5(&path2, "900150983cd24fb0d6963f7d28e17f72").unwrap());
+        // Case-insensitive (manifest hashes happen to be lowercase but defensive).
+        assert!(verify_md5(&path2, "900150983CD24FB0D6963F7D28E17F72").unwrap());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// v0.15 — every host arch we map to a manifest key has a non-empty

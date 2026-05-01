@@ -155,6 +155,29 @@ enum PromptAction {
         id: u64,
         name: String,
     },
+    /// v0.15.1 — confirm the setup-wizard plan. User types `yes` to proceed.
+    /// We don't reuse a name (no obvious noun here) so a typed "yes" is
+    /// fine; the prompt title shows the full plan.
+    ConfirmSetupWizard {
+        plan: SetupPlan,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct SetupPlan {
+    /// `Some` when frpc isn't already on disk; `None` to skip the download
+    /// step (user already has a copy).
+    download: Option<SetupDownload>,
+    /// Tunnel ids that will be added to `frpc_enabled_ids` when the wizard
+    /// commits. Empty means "user has no tunnels" — wizard refuses earlier.
+    tunnel_ids: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct SetupDownload {
+    url: String,
+    md5: String,
+    target: PathBuf,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -672,6 +695,229 @@ impl App {
     }
 
     // ---------- v0.15: frpc subprocess lifecycle ----------
+
+    // ---------- v0.15.1: setup wizard ----------
+    //
+    // Single key (`i`) drives the whole onboarding flow: download the right
+    // frpc binary, verify md5, enable every tunnel the user has on the
+    // SakuraFrp account, start frpc. Each step produces a status update so
+    // a stuck wizard tells the user where it stuck.
+
+    /// `i` pressed on SakuraFrp tab → build a plan, confirm, execute.
+    fn start_setup_wizard(&mut self) {
+        // Prereqs: token must be set; tunnels must be loaded; we must have
+        // resolved the host's target arch.
+        if self.natfrp_token.is_none() {
+            self.status = match self.lang {
+                Lang::En => "✗ Set a SakuraFrp token first (press t).".into(),
+                Lang::Zh => "✗ 请先设置 SakuraFrp token（按 t）。".into(),
+            };
+            return;
+        }
+        if !self.natfrp_loaded {
+            self.status = match self.lang {
+                Lang::En => "✗ Press r to load tunnels first.".into(),
+                Lang::Zh => "✗ 请先按 r 加载隧道。".into(),
+            };
+            return;
+        }
+        if self.natfrp_tunnels.is_empty() {
+            self.status = match self.lang {
+                Lang::En => "✗ No tunnels on this account — create one first (press c).".into(),
+                Lang::Zh => "✗ 账户没有隧道 — 请先按 c 创建。".into(),
+            };
+            return;
+        }
+
+        // Make sure we have the manifest. One-shot fetch.
+        if self.clients_manifest.is_none() {
+            match natfrp::fetch_clients_manifest() {
+                Ok(m) => self.clients_manifest = Some(m),
+                Err(e) => {
+                    self.status = translate_natfrp_error(self.lang, &e);
+                    return;
+                }
+            }
+        }
+        let manifest = self.clients_manifest.as_ref().unwrap();
+        let Some((os, arch)) = data::host_target_for_manifest() else {
+            self.status = match self.lang {
+                Lang::En => format!(
+                    "✗ Host platform {}/{} not in SakuraFrp's binary list.",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+                Lang::Zh => format!(
+                    "✗ 当前平台 {}/{} 不在 SakuraFrp 官方下载清单里。",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+            };
+            return;
+        };
+        let key = format!("{}_{}", os, arch);
+        let Some(arch_entry) = manifest.frpc_archs.get(&key) else {
+            self.status = match self.lang {
+                Lang::En => format!("✗ Manifest has no entry for {}.", key),
+                Lang::Zh => format!("✗ 清单里没有 {} 的下载项。", key),
+            };
+            return;
+        };
+
+        let install_path = sys::config_dir().join("frpc");
+        let download = if self.frpc_binary.is_some() {
+            // Already on disk — skip the network round-trip.
+            None
+        } else {
+            Some(SetupDownload {
+                url: arch_entry.url.clone(),
+                md5: arch_entry.hash.clone(),
+                target: install_path.clone(),
+            })
+        };
+
+        let tunnel_ids: Vec<u64> = self.natfrp_tunnels.iter().map(|t| t.id).collect();
+        let plan = SetupPlan {
+            download,
+            tunnel_ids,
+        };
+
+        // Build a human-readable summary for the prompt title.
+        let summary = self.summarize_setup_plan(&plan);
+
+        self.prompt = Some(InputPrompt {
+            title: summary,
+            label: match self.lang {
+                Lang::En => "type yes".into(),
+                Lang::Zh => "输入 yes".into(),
+            },
+            buffer: String::new(),
+            action: PromptAction::ConfirmSetupWizard { plan },
+        });
+    }
+
+    fn summarize_setup_plan(&self, plan: &SetupPlan) -> String {
+        let mut steps: Vec<String> = Vec::new();
+        if let Some(d) = &plan.download {
+            steps.push(match self.lang {
+                Lang::En => format!("download frpc → {}", d.target.display()),
+                Lang::Zh => format!("下载 frpc → {}", d.target.display()),
+            });
+        }
+        let names: Vec<String> = plan
+            .tunnel_ids
+            .iter()
+            .filter_map(|id| {
+                self.natfrp_tunnels
+                    .iter()
+                    .find(|t| t.id == *id)
+                    .map(|t| t.name.clone())
+            })
+            .collect();
+        steps.push(match self.lang {
+            Lang::En => format!("enable {}", names.join(", ")),
+            Lang::Zh => format!("启用 {}", names.join("、")),
+        });
+        steps.push(match self.lang {
+            Lang::En => "start frpc (tmux)".into(),
+            Lang::Zh => "启动 frpc (tmux)".into(),
+        });
+        match self.lang {
+            Lang::En => format!("Setup wizard: {}.", steps.join(" → ")),
+            Lang::Zh => format!("一键配置：{}。", steps.join(" → ")),
+        }
+    }
+
+    /// Confirmation accepted — run the plan. Status updates show progress
+    /// step by step so a hung wizard reveals the stuck step.
+    fn execute_setup_wizard(&mut self, plan: SetupPlan) {
+        // Step 1: download (if planned).
+        if let Some(d) = &plan.download {
+            self.status = match self.lang {
+                Lang::En => format!("→ Downloading frpc from {}…", d.url),
+                Lang::Zh => format!("→ 正在下载 frpc：{}…", d.url),
+            };
+            // The status bar won't actually repaint mid-call (we're on the
+            // event-loop thread), but the message lands once we return.
+            // ureq blocking ~5–10 s on a fast link.
+            if let Some(parent) = d.target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(e) = data::download_frpc(&d.url, &d.target) {
+                self.status = match self.lang {
+                    Lang::En => format!("✗ Download failed: {}", e),
+                    Lang::Zh => format!("✗ 下载失败：{}", e),
+                };
+                return;
+            }
+            // Step 1b: verify md5.
+            match data::verify_md5(&d.target, &d.md5) {
+                Ok(true) => {}
+                Ok(false) => {
+                    let _ = std::fs::remove_file(&d.target);
+                    self.status = match self.lang {
+                        Lang::En => "✗ Downloaded frpc md5 mismatch — file removed. Try again.".into(),
+                        Lang::Zh => "✗ 下载的 frpc md5 不匹配 — 已删除，请重试。".into(),
+                    };
+                    return;
+                }
+                Err(e) => {
+                    self.status = match self.lang {
+                        Lang::En => format!("✗ md5 check failed: {}", e),
+                        Lang::Zh => format!("✗ md5 校验失败：{}", e),
+                    };
+                    return;
+                }
+            }
+            self.frpc_binary = data::find_frpc_binary();
+        }
+
+        // Step 2: enable the requested tunnel ids (in addition to whatever
+        // was already enabled — preserves manual prior toggles).
+        for id in &plan.tunnel_ids {
+            if !self.frpc_enabled_ids.contains(id) {
+                self.frpc_enabled_ids.push(*id);
+            }
+        }
+        self.frpc_enabled_ids.sort_unstable();
+        self.frpc_enabled_ids.dedup();
+        if let Err(e) = self.persist_state() {
+            self.status = match self.lang {
+                Lang::En => format!("✗ Failed to persist state: {}", e),
+                Lang::Zh => format!("✗ 保存状态失败：{}", e),
+            };
+            return;
+        }
+
+        // Step 3: bounce frpc so the new enabled list takes effect.
+        match self.restart_frpc() {
+            Ok(()) => {
+                self.status = match self.lang {
+                    Lang::En => format!(
+                        "✓ Setup complete: {} tunnel(s) enabled, frpc running.",
+                        plan.tunnel_ids.len()
+                    ),
+                    Lang::Zh => format!(
+                        "✓ 一键配置完成：已启用 {} 条隧道，frpc 已运行。",
+                        plan.tunnel_ids.len()
+                    ),
+                };
+                self.refresh_launcher_state();
+            }
+            Err(e) => {
+                self.status = match self.lang {
+                    Lang::En => format!(
+                        "✓ Tunnels enabled, but frpc start failed: {}",
+                        e
+                    ),
+                    Lang::Zh => format!(
+                        "✓ 隧道已启用，但 frpc 启动失败：{}",
+                        e
+                    ),
+                };
+            }
+        }
+    }
 
     fn frpc_session_name(&self) -> String {
         sys::frpc_tmux_session_name(&self.server_dir)
@@ -2131,6 +2377,16 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         PromptAction::ConfirmDeleteTunnel { id, name } => {
                             app.handle_confirm_delete_tunnel(&value, id, &name)
                         }
+                        PromptAction::ConfirmSetupWizard { plan } => {
+                            if value.trim() == "yes" {
+                                app.execute_setup_wizard(plan);
+                            } else {
+                                app.status = match app.lang {
+                                    Lang::En => "→ Setup cancelled.".into(),
+                                    Lang::Zh => "→ 已取消一键配置。".into(),
+                                };
+                            }
+                        }
                     }
                 }
                 KeyCode::Backspace => {
@@ -2303,6 +2559,9 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             }
             KeyCode::Char('x') if app.tab == TabId::SakuraFrp => {
                 app.disable_selected_tunnel();
+            }
+            KeyCode::Char('i') if app.tab == TabId::SakuraFrp => {
+                app.start_setup_wizard();
             }
             KeyCode::Char('o') => match app.tab {
                 TabId::Players => app.toggle_op_for_selected()?,

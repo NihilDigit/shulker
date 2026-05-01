@@ -285,6 +285,13 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] Non-game-friendly node selection appends a dim warning to status (long-idle TCP can drop after ~30s).
 - [x] `screenshot --picker create|migrate` for QA without firing destructive ops.
 
+### v0.15.1 — One-key setup wizard (shipped 2026-05-01)
+
+- [x] `i` on the SakuraFrp tab opens a confirm prompt summarizing the planned migration: download frpc → enable every visible tunnel → start frpc. User types `yes` to commit, anything else cancels.
+- [x] Download path: `data::download_frpc(url, target)` streams the official binary in 64 KiB chunks via the existing ureq agent, atomically renames the temp file into place, and chmod 0755. Url + md5 come from the `/v4/system/clients` manifest (host arch resolved via `data::host_target_for_manifest`).
+- [x] Md5 verification (`data::verify_md5`) — corrupted downloads are deleted before the wizard can use them, so a half-fetched binary never gets executed.
+- [x] No docker-removal step: by design, the wizard doesn't touch any pre-existing launcher container. If the user has one running it'll fight with mc-tui's frpc; the migration step (`docker stop natfrp-service`) is a deliberate manual op.
+
 ### v0.15 — Direct frpc subprocess (shipped 2026-05-01)
 
 - [x] mc-tui now runs the SakuraFrp `frpc` binary itself via tmux instead of routing through the launcher container. Sub-second restart on tunnel toggle (vs ~10 s container restart).
