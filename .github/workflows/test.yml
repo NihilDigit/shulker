@@ -3,7 +3,22 @@ name: Test
 on:
   push:
     branches: [main]
+    # Skip pure docs / install-script / housekeeping pushes — they can't
+    # affect cargo build/test outcome. Anything outside this ignore-list
+    # (Rust source, Cargo.toml/lock, the workflow itself) still triggers.
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'scripts/**'
+      - '.gitignore'
+      - '.github/workflows/release.yml'
   pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'LICENSE'
+      - 'scripts/**'
+      - '.gitignore'
+      - '.github/workflows/release.yml'
 
 env:
   # See release.yml for the rationale — actions/checkout / softprops are still
