@@ -234,15 +234,18 @@ pub fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
+/// Expand a leading `~` / `~/...` to the user's home dir. Cross-platform via
+/// `dirs::home_dir()` (Unix: `$HOME`; Windows: `%USERPROFILE%`). Anything
+/// that isn't `~` or `~/...` is returned as-is so absolute paths still round-trip.
 pub fn expand_tilde(p: &str) -> PathBuf {
     if let Some(rest) = p.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
+        if let Some(home) = dirs::home_dir() {
+            return home.join(rest);
         }
     }
     if p == "~" {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home);
+        if let Some(home) = dirs::home_dir() {
+            return home;
         }
     }
     PathBuf::from(p)

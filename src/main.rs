@@ -3265,13 +3265,22 @@ mod tests {
 
     #[test]
     fn expand_tilde_replaces_home() {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        // Cross-platform: dirs::home_dir() is Unix `$HOME` / Windows `%USERPROFILE%`.
+        // CI runners always have a home set; if a sandbox ever doesn't, skip
+        // the assertion rather than fail (the production code path falls back
+        // to the literal input, which is still safe).
+        let Some(home) = dirs::home_dir() else { return };
         let p = expand_tilde("~/foo/bar");
-        assert!(p.starts_with(&home), "expected {} to start with {}", p.display(), home);
+        assert!(
+            p.starts_with(&home),
+            "expected {} to start with {}",
+            p.display(),
+            home.display()
+        );
         let p = expand_tilde("/abs/path");
         assert_eq!(p, PathBuf::from("/abs/path"));
         let p = expand_tilde("~");
-        assert_eq!(p, PathBuf::from(&home));
+        assert_eq!(p, home);
     }
 
     #[test]
@@ -3879,6 +3888,13 @@ players:
         assert!(alice.op_level.is_none());
     }
 
+    /// Linux-only because the sandbox here uses `XDG_CONFIG_HOME` to redirect
+    /// writes into a tempdir. The `dirs` crate ignores XDG on macOS (uses
+    /// `~/Library/Application Support`) and on Windows (uses `%APPDATA%`), so
+    /// running this elsewhere would write into the runner's real home — a CI
+    /// hazard, not a testable invariant. The 0600 + roundtrip behavior the
+    /// test exercises is platform-agnostic; covering it on Linux is enough.
+    #[cfg(target_os = "linux")]
     #[test]
     fn natfrp_token_roundtrip_with_0600_perms() {
         let dir = tempdir();
@@ -3894,13 +3910,9 @@ players:
         assert!(path.starts_with(&dir));
         assert_eq!(read_natfrp_token().as_deref(), Some("hello-token-123"));
 
-        // 0600
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "want 0600, got {:o}", mode);
-        }
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "want 0600, got {:o}", mode);
 
         // empty file → None
         fs::write(&path, "   ").unwrap();
