@@ -21,7 +21,8 @@ use crate::i18n::{
     server_action_label, tab_name, Lang, Strings,
 };
 use crate::{
-    App, InputPrompt, NodePickerPurpose, NodePickerState, TabId, YamlView, SERVER_ACTIONS, TABS,
+    App, InputPrompt, LogsView, NodePickerPurpose, NodePickerState, TabId, YamlView,
+    SERVER_ACTIONS, TABS,
 };
 
 pub fn ui(f: &mut Frame, app: &mut App) {
@@ -389,8 +390,18 @@ fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         Color::DarkGray
     };
+    let online_count = app.players.iter().filter(|p| p.is_online).count();
+    let online_label = match app.lang {
+        Lang::En => format!("▶ {} online", online_count),
+        Lang::Zh => format!("▶ 在线 {} 人", online_count),
+    };
     let legend = Paragraph::new(Line::from(vec![
         Span::raw(" "),
+        Span::styled(
+            online_label,
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("    "),
         Span::styled(legend_text, Style::default().fg(legend_color).add_modifier(Modifier::BOLD)),
     ]));
     f.render_widget(legend, chunks[0]);
@@ -422,6 +433,18 @@ fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
 fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> ListItem<'static> {
     let s = lang.s();
 
+    // Online marker (column 0): ▶ green when player is currently logged in,
+    // empty otherwise. Distinct glyph from the WL ●/○ to avoid conflation;
+    // the host sees who's *playing right now* at a glance without scrolling.
+    let online_span = if p.is_online {
+        Span::styled(
+            " ▶ ",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("   ")
+    };
+
     // OP marker: ★n (yellow) when op, "  " (gray dot) when not.
     let op_span = match p.op_level {
         Some(level) => Span::styled(
@@ -442,7 +465,16 @@ fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> Lis
         Span::raw("   ")
     };
 
-    let name_color = if p.historical_only { Color::DarkGray } else { Color::White };
+    // Online players get bright green + bold names (overrides the gray
+    // historical-only color, which can't be true for online players anyway —
+    // scan_players already flips historical_only=false for online).
+    let (name_color, name_modifier) = if p.is_online {
+        (Color::Green, Modifier::BOLD)
+    } else if p.historical_only {
+        (Color::DarkGray, Modifier::empty())
+    } else {
+        (Color::White, Modifier::empty())
+    };
     let name_label = if p.historical_only {
         format!(" {} {} ", p.name, s.players_historical_marker)
     } else {
@@ -450,9 +482,13 @@ fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> Lis
     };
 
     let mut spans: Vec<Span> = vec![
+        online_span,
         wl_span,
         op_span,
-        Span::styled(format!("{:24}", truncate_display(&name_label, 24)), Style::default().fg(name_color)),
+        Span::styled(
+            format!("{:24}", truncate_display(&name_label, 24)),
+            Style::default().fg(name_color).add_modifier(name_modifier),
+        ),
         Span::styled(
             format!(" {:36} ", &p.uuid),
             Style::default().fg(Color::DarkGray),
@@ -624,26 +660,171 @@ fn draw_config_detail(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
-    let log_path = app.server_dir.join("logs/latest.log");
-    let body = if log_path.exists() {
-        match fs::read_to_string(&log_path) {
-            Ok(s) => {
-                let lines: Vec<&str> = s.lines().collect();
-                let n = lines.len();
-                let take = (area.height as usize).saturating_sub(2).max(1);
-                let start = n.saturating_sub(take);
-                lines[start..].join("\n")
-            }
-            Err(e) => fmt_log_read_error(app.lang, &e.to_string()),
+    // Vertical split: 2-line header (watchdog summary) + scrolling body.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(3)])
+        .split(area);
+    draw_logs_watchdog_summary(f, chunks[0], app);
+    draw_logs_body(f, chunks[1], app);
+}
+
+fn draw_logs_watchdog_summary(f: &mut Frame, area: Rect, app: &App) {
+    let summary = match &app.logs_view {
+        LogsView::Server => crate::data::watchdog_summary(&app.server_dir),
+        LogsView::Frpc => crate::data::WatchdogSummary::default(),
+    };
+    let zh = matches!(app.lang, Lang::Zh);
+    let view_label = match (app.logs_view, zh) {
+        (LogsView::Server, true) => "[服务器日志]",
+        (LogsView::Server, false) => "[server log]",
+        (LogsView::Frpc, true) => "[frpc 日志]",
+        (LogsView::Frpc, false) => "[frpc log]",
+    };
+    let toggle_hint = if zh {
+        "f 切到 frpc"
+    } else {
+        "f → frpc"
+    };
+    let mut spans: Vec<Span> = vec![
+        Span::styled(
+            format!(" {} ", view_label),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("({})  ", toggle_hint),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    // Watchdog counts only meaningful for server view.
+    if matches!(app.logs_view, LogsView::Server) {
+        let lag_color = if summary.tick_lag_count > 0 {
+            Color::Red
+        } else {
+            Color::DarkGray
+        };
+        let gc_color = if summary.long_gc_count > 0 {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        spans.push(Span::styled(
+            if zh {
+                format!("近 30 分：⚠ tick lag × {}", summary.tick_lag_count)
+            } else {
+                format!("last 30 min: ⚠ tick lag × {}", summary.tick_lag_count)
+            },
+            Style::default().fg(lag_color).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            if zh {
+                format!("⚠ GC>500ms × {}", summary.long_gc_count)
+            } else {
+                format!("⚠ GC>500ms × {}", summary.long_gc_count)
+            },
+            Style::default().fg(gc_color).add_modifier(Modifier::BOLD),
+        ));
+        if let Some(last_warn) = summary.last_event_label {
+            spans.push(Span::raw("   "));
+            spans.push(Span::styled(
+                if zh {
+                    format!("最近：{}", last_warn)
+                } else {
+                    format!("most recent: {}", last_warn)
+                },
+                Style::default().fg(Color::DarkGray),
+            ));
         }
     } else {
-        app.lang.s().no_logs_yet.to_string()
+        spans.push(Span::styled(
+            if zh {
+                format!("tmux: {}", crate::sys::frpc_tmux_session_name(&app.server_dir))
+            } else {
+                format!("tmux: {}", crate::sys::frpc_tmux_session_name(&app.server_dir))
+            },
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    let p = Paragraph::new(Line::from(spans));
+    f.render_widget(p, area);
+}
+
+fn draw_logs_body(f: &mut Frame, area: Rect, app: &App) {
+    let (title, body) = match app.logs_view {
+        LogsView::Server => {
+            let log_path = app.server_dir.join("logs/latest.log");
+            let body = if log_path.exists() {
+                match fs::read_to_string(&log_path) {
+                    Ok(s) => s,
+                    Err(e) => fmt_log_read_error(app.lang, &e.to_string()),
+                }
+            } else {
+                app.lang.s().no_logs_yet.to_string()
+            };
+            (
+                format!("{}{} ", app.lang.s().title_logs_prefix, log_path.display()),
+                body,
+            )
+        }
+        LogsView::Frpc => {
+            let session = crate::sys::frpc_tmux_session_name(&app.server_dir);
+            let body = crate::data::tmux_capture_pane(&session, 1000)
+                .unwrap_or_else(|e| match app.lang {
+                    Lang::En => format!(
+                        "(no frpc session — start it from the Server tab. Detail: {})",
+                        e
+                    ),
+                    Lang::Zh => format!(
+                        "(没有 frpc tmux session — 请到运维 tab 启动。详情：{})",
+                        e
+                    ),
+                });
+            (
+                match app.lang {
+                    Lang::En => format!(" frpc — tmux: {} ", session),
+                    Lang::Zh => format!(" frpc — tmux: {} ", session),
+                },
+                body,
+            )
+        }
     };
-    let title = format!("{}{} ", app.lang.s().title_logs_prefix, log_path.display());
-    let p = Paragraph::new(body)
+    // Take only the last `area.height - 2` lines so the view follows tail.
+    let lines: Vec<&str> = body.lines().collect();
+    let take = (area.height as usize).saturating_sub(2).max(1);
+    let start = lines.len().saturating_sub(take);
+    let visible = &lines[start..];
+
+    // Render each line with a per-severity color picked from its content.
+    let rendered: Vec<Line> = visible
+        .iter()
+        .map(|line| Line::from(colorize_log_line(line)))
+        .collect();
+    let p = Paragraph::new(rendered)
         .block(Block::default().borders(Borders::ALL).title(title))
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
+}
+
+/// Colorize one log line based on a substring scan. Cheap (single linear scan)
+/// and good enough — a real log parser would be overkill for tail-mode.
+pub fn colorize_log_line(line: &str) -> Vec<Span<'static>> {
+    let lower = line.to_ascii_lowercase();
+    let style = if line.contains("[ERROR]") || lower.contains("/error]:") {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else if line.contains("[WARN]") || lower.contains("/warn]:") {
+        Style::default().fg(Color::Yellow)
+    } else if line.contains("joined the game") {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    } else if line.contains("left the game") || line.contains("lost connection") {
+        Style::default().fg(Color::Cyan)
+    } else if line.contains("Done (") && line.contains("s)! For help, type") {
+        // Server fully started — important breadcrumb when scanning by eye.
+        Style::default().fg(Color::Green)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    vec![Span::styled(line.to_string(), style)]
 }
 
 fn draw_yaml(f: &mut Frame, area: Rect, app: &mut App) {

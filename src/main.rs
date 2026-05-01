@@ -118,6 +118,14 @@ enum YamlView {
     Editing { file_idx: usize },
 }
 
+/// Logs tab can show either the MC server log (default) or the frpc tmux
+/// capture-pane output. Toggled via `f`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogsView {
+    Server,
+    Frpc,
+}
+
 #[derive(Debug, Clone)]
 struct InputPrompt {
     pub title: String,
@@ -246,6 +254,8 @@ struct App {
     pub yaml_files: Vec<PathBuf>,
     pub yaml_files_state: ListState,
     pub yaml_view: YamlView,
+    /// Logs tab subview: server log (default) or frpc tmux capture-pane.
+    pub logs_view: LogsView,
     pub yaml_root: Option<serde_yaml::Value>,
     pub yaml_rows: Vec<YamlRow>,
     pub yaml_rows_state: ListState,
@@ -348,6 +358,7 @@ impl App {
             yaml_files: Vec::new(),
             yaml_files_state: ListState::default(),
             yaml_view: YamlView::Files,
+            logs_view: LogsView::Server,
             yaml_root: None,
             yaml_rows: Vec::new(),
             yaml_rows_state: ListState::default(),
@@ -467,6 +478,7 @@ impl App {
             &cur,
             &self.whitelist,
             &self.ops,
+            self.pid.is_some(),
         );
         // Keep selection in range after the merge.
         if let Some(i) = self.players_state.selected() {
@@ -2563,6 +2575,12 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             KeyCode::Char('i') if app.tab == TabId::SakuraFrp => {
                 app.start_setup_wizard();
             }
+            KeyCode::Char('f') if app.tab == TabId::Logs => {
+                app.logs_view = match app.logs_view {
+                    LogsView::Server => LogsView::Frpc,
+                    LogsView::Frpc => LogsView::Server,
+                };
+            }
             KeyCode::Char('o') => match app.tab {
                 TabId::Players => app.toggle_op_for_selected()?,
                 TabId::SakuraFrp => app.open_natfrp_dashboard(),
@@ -3768,7 +3786,7 @@ players:
             "[00:06:00] [User Authenticator #4/INFO]: UUID of player AlphaGuy is aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
         ];
         let mut acc = LogScanResult::default();
-        scan_lines(&lines, 1_000_000, &mut acc);
+        scan_lines(&lines, 1_000_000, false, &mut acc);
         assert_eq!(acc.uuid_by_name.get("Urisaki").map(|s| s.as_str()), Some("43b6b1f9-4219-3f2c-a702-036847c8b8cc"));
         assert_eq!(acc.uuid_by_name.get("AlphaGuy").map(|s| s.as_str()), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
     }
@@ -3780,7 +3798,7 @@ players:
             "[23:51:02] [Server thread/INFO]: Added Urisaki to the whitelist".to_string(),
         ];
         let mut acc = LogScanResult::default();
-        scan_lines(&lines, 1_700_000_000, &mut acc);
+        scan_lines(&lines, 1_700_000_000, false, &mut acc);
         assert_eq!(acc.last_denied_by_name.get("Urisaki").copied(), Some(1_700_000_000));
     }
 
@@ -3790,9 +3808,9 @@ players:
             "[20:00:00] [Server thread/INFO]: Disconnecting Urisaki (/x): You are not whitelisted on this server!".to_string(),
         ];
         let mut acc = LogScanResult::default();
-        scan_lines(&lines, 1_700_000_000, &mut acc);
-        scan_lines(&lines, 1_700_086_400, &mut acc); // newer date
-        scan_lines(&lines, 1_699_900_000, &mut acc); // older date — must NOT overwrite
+        scan_lines(&lines, 1_700_000_000, false, &mut acc);
+        scan_lines(&lines, 1_700_086_400, false, &mut acc); // newer date
+        scan_lines(&lines, 1_699_900_000, false, &mut acc); // older date — must NOT overwrite
         assert_eq!(acc.last_denied_by_name.get("Urisaki").copied(), Some(1_700_086_400));
     }
 
@@ -3833,7 +3851,7 @@ players:
         let wl = vec![WhitelistEntry { uuid: "u1".into(), name: "Alice".into() }];
         let ops = vec![OpEntry { uuid: "u2".into(), name: "Bob".into(), level: 4, bypasses_player_limit: false }];
         // No log dir → no log entries.
-        let players = scan_players(&dir, "world", &wl, &ops);
+        let players = scan_players(&dir, "world", &wl, &ops, false);
         // Expect: Bob (op, bucket 1) before Alice (whitelist-only, bucket 2)
         let names: Vec<_> = players.iter().map(|p| p.name.clone()).collect();
         assert_eq!(names, vec!["Bob".to_string(), "Alice".to_string()]);

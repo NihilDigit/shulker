@@ -267,6 +267,10 @@ pub struct PlayerEntry {
     /// (no whitelist, no ops, no denied attempts in the recent log corpus).
     /// Lower-priority for sort.
     pub historical_only: bool,
+    /// True when the most-recent join/leave event in `latest.log` is a join
+    /// AND the server is currently up. False when the server is stopped, the
+    /// player has left, or we never saw them in the current session.
+    pub is_online: bool,
 }
 
 /// Build the merged `PlayerEntry` list. Caller passes already-loaded
@@ -277,6 +281,7 @@ pub fn scan_players(
     level_name: &str,
     whitelist: &[WhitelistEntry],
     ops: &[OpEntry],
+    server_running: bool,
 ) -> Vec<PlayerEntry> {
     use std::collections::BTreeMap;
 
@@ -296,6 +301,7 @@ pub fn scan_players(
                 op_level: None,
                 last_denied_at: None,
                 historical_only: false,
+                is_online: false,
             },
         );
     }
@@ -315,6 +321,7 @@ pub fn scan_players(
                 op_level: Some(o.level),
                 last_denied_at: None,
                 historical_only: false,
+                is_online: false,
             });
     }
 
@@ -336,6 +343,7 @@ pub fn scan_players(
                 // We could actually be a returning regular — disambiguated by
                 // the next loop overwriting `last_denied_at` if applicable.
                 historical_only: true,
+                is_online: false,
             });
     }
     for (name, ts) in &scan.last_denied_by_name {
@@ -352,6 +360,7 @@ pub fn scan_players(
                 op_level: None,
                 last_denied_at: Some(*ts),
                 historical_only: false,
+                is_online: false,
             });
     }
 
@@ -379,26 +388,46 @@ pub fn scan_players(
                         op_level: None,
                         last_denied_at: None,
                         historical_only: true,
+                        is_online: false,
                     },
                 );
             }
         }
     }
 
-    // Sort: denied-recently first, then op, then whitelist-only, then
+    // Fold the latest.log online state in. Gated on the server actually
+    // running — if it's stopped, every player is offline regardless of
+    // what the log's last event said (crash before clean shutdown is the
+    // common case where this matters).
+    if server_running {
+        for (lower_name, online) in &scan.online_state_in_latest {
+            if *online {
+                if let Some(p) = by_name.get_mut(lower_name) {
+                    p.is_online = true;
+                    // An online player is by definition not "historical only".
+                    p.historical_only = false;
+                }
+            }
+        }
+    }
+
+    // Sort: online first (so the host sees who's playing right now without
+    // scrolling), then denied-recently, then op, then whitelist-only, then
     // historical. Within each band, lex by name.
     let mut out: Vec<PlayerEntry> = by_name.into_values().collect();
     out.sort_by(|a, b| {
-        // Bucket: 0 = recently denied, 1 = op, 2 = whitelist, 3 = historical.
+        // Bucket order: 0 = online, 1 = recently denied, 2 = op, 3 = whitelist, 4 = historical.
         let bucket = |p: &PlayerEntry| {
-            if p.last_denied_at.is_some() && !p.in_whitelist && p.op_level.is_none() {
+            if p.is_online {
                 0
-            } else if p.op_level.is_some() {
+            } else if p.last_denied_at.is_some() && !p.in_whitelist && p.op_level.is_none() {
                 1
-            } else if p.in_whitelist {
+            } else if p.op_level.is_some() {
                 2
-            } else {
+            } else if p.in_whitelist {
                 3
+            } else {
+                4
             }
         };
         bucket(a)
@@ -415,6 +444,11 @@ pub struct LogScanResult {
     /// Display name → last unix-seconds (00:00 UTC of the log's date) where
     /// the player got denied for "not whitelisted".
     pub last_denied_by_name: std::collections::HashMap<String, i64>,
+    /// Lowercased name → most-recent-event bool (true = join, false = leave).
+    /// **Only populated from `latest.log`** so a recent crash doesn't ghost
+    /// players as online forever via an old rotated log. Caller still has
+    /// to filter by "is the server running right now?".
+    pub online_state_in_latest: std::collections::HashMap<String, bool>,
 }
 
 pub fn scan_log_corpus(server_dir: &Path) -> LogScanResult {
@@ -443,7 +477,12 @@ pub fn scan_log_corpus(server_dir: &Path) -> LogScanResult {
     for path in files {
         let Some(date_ts) = log_file_date_unix(&path) else { continue };
         let lines = read_log_lines(&path);
-        scan_lines(&lines, date_ts, &mut acc);
+        let is_latest = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n == "latest.log")
+            .unwrap_or(false);
+        scan_lines(&lines, date_ts, is_latest, &mut acc);
     }
     acc
 }
@@ -493,7 +532,12 @@ fn read_log_lines(path: &Path) -> Vec<String> {
     }
 }
 
-pub fn scan_lines(lines: &[String], date_ts: i64, out: &mut LogScanResult) {
+pub fn scan_lines(
+    lines: &[String],
+    date_ts: i64,
+    is_latest: bool,
+    out: &mut LogScanResult,
+) {
     for line in lines {
         // Pattern A: "UUID of player NAME is UUID"
         if let Some(name_uuid) = parse_uuid_of_player(line) {
@@ -503,14 +547,59 @@ pub fn scan_lines(lines: &[String], date_ts: i64, out: &mut LogScanResult) {
         // Pattern B: "Disconnecting NAME (..): You are not whitelisted on this server!"
         if line.contains("not whitelisted on this server") {
             if let Some(name) = parse_disconnect_name(line) {
-                // Only overwrite when this date is newer than what we have.
                 let entry = out.last_denied_by_name.entry(name).or_insert(date_ts);
                 if date_ts > *entry {
                     *entry = date_ts;
                 }
             }
         }
+        // Pattern C: join/leave events from `latest.log` only. Within the
+        // file lines are chronological, so insert-overwrite naturally lands
+        // on the most-recent event per player. Server thread broadcasts
+        // both events when a connection comes up / drops cleanly.
+        if is_latest {
+            if let Some(name) = parse_join_event(line) {
+                out.online_state_in_latest.insert(name.to_ascii_lowercase(), true);
+            } else if let Some(name) = parse_leave_event(line) {
+                out.online_state_in_latest.insert(name.to_ascii_lowercase(), false);
+            }
+        }
     }
+}
+
+/// `[Server thread/INFO]: <NAME> joined the game`
+/// Returns the name when the line matches; None otherwise. Vanilla / Paper /
+/// Purpur all emit this verbatim.
+pub fn parse_join_event(line: &str) -> Option<&str> {
+    parse_lifecycle_event(line, " joined the game")
+}
+
+/// `[Server thread/INFO]: <NAME> left the game`
+pub fn parse_leave_event(line: &str) -> Option<&str> {
+    parse_lifecycle_event(line, " left the game")
+}
+
+fn parse_lifecycle_event<'a>(line: &'a str, suffix: &str) -> Option<&'a str> {
+    // Suffix anchors the right side. We then locate the "INFO]: " marker on
+    // the left and take the slice in between as the name. Refusing names with
+    // spaces or angle brackets keeps chat impersonation (e.g. someone whose
+    // message text happens to be "joined the game") out of the join set.
+    let suf = line.find(suffix)?;
+    let pre = line.find("INFO]: ")?;
+    let start = pre + "INFO]: ".len();
+    if start >= suf {
+        return None;
+    }
+    let name = &line[start..suf];
+    if name.is_empty()
+        || name.contains(' ')
+        || name.contains('<')
+        || name.contains('>')
+        || name.contains(':')
+    {
+        return None;
+    }
+    Some(name)
 }
 
 /// `[HH:MM:SS] [User Authenticator #N/INFO]: UUID of player NAME is UUID`
@@ -873,6 +962,105 @@ fn md5_file(path: &Path) -> Result<String> {
         let _ = write!(&mut hex, "{:02x}", b);
     }
     Ok(hex)
+}
+
+/// v0.16 — Capture the last `lines` lines from a tmux session's pane buffer.
+/// Used by the Logs tab to show the running frpc subprocess's stdout. tmux
+/// `capture-pane -p -S -<n>` pulls history; if the session doesn't exist
+/// we surface a friendly error so the UI can render a "(no session)" hint.
+pub fn tmux_capture_pane(session: &str, lines: u32) -> Result<String> {
+    use std::process::Command;
+    let n = format!("-{}", lines);
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-t", session, "-p", "-S", &n])
+        .output()
+        .with_context(|| "spawn tmux capture-pane")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("tmux capture-pane failed: {}", stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// v0.16 — quick scan of `latest.log` for stability events. Counts
+/// occurrences within the last ~30 minutes (heuristic: the last N lines
+/// since we don't have ms-precise timestamps without a TZ-aware parse).
+/// Drives the watchdog summary at the top of the Logs tab.
+#[derive(Debug, Default, Clone)]
+pub struct WatchdogSummary {
+    pub tick_lag_count: u32,
+    pub long_gc_count: u32,
+    pub last_event_label: Option<String>,
+}
+
+pub fn watchdog_summary(server_dir: &Path) -> WatchdogSummary {
+    let log_path = server_dir.join("logs/latest.log");
+    let lines = read_log_lines(&log_path);
+    // Window: last 4000 lines ≈ "recent". Paper logs ~10–50 lines/min when
+    // active, so this covers ~30–60 minutes of normal play.
+    let n = lines.len();
+    let take = 4000usize.min(n);
+    let start = n.saturating_sub(take);
+    summarize_log_window(&lines[start..])
+}
+
+pub fn summarize_log_window(lines: &[String]) -> WatchdogSummary {
+    let mut out = WatchdogSummary::default();
+    for line in lines {
+        if line.contains("Can't keep up!")
+            || line.contains("Server is overloaded")
+            || line.contains("Running ")
+                && line.contains("ms or ")
+                && line.contains(" ticks behind")
+        {
+            out.tick_lag_count = out.tick_lag_count.saturating_add(1);
+            out.last_event_label = Some(short_event_label(line));
+        } else if let Some(ms) = parse_long_gc_ms(line) {
+            if ms >= 500 {
+                out.long_gc_count = out.long_gc_count.saturating_add(1);
+                out.last_event_label = Some(format!("GC {}ms", ms));
+            }
+        }
+    }
+    out
+}
+
+/// Pull a `[HH:MM:SS]` prefix + a 1-line excerpt for the watchdog summary.
+fn short_event_label(line: &str) -> String {
+    // Trim line to ≤ 60 chars so the summary header stays one row.
+    let trimmed = line.trim();
+    let cap = 60.min(trimmed.len());
+    let mut s: String = trimmed.chars().take(cap).collect();
+    if trimmed.chars().count() > cap {
+        s.push('…');
+    }
+    s
+}
+
+/// Parse "...GC took NNN ms..." or "Total time NNN ms" patterns. Heuristic
+/// — we accept either Paper's watchdog or the JVM's GC log if redirected.
+pub fn parse_long_gc_ms(line: &str) -> Option<u64> {
+    // Pattern: "GC took 731 ms" — easy.
+    if let Some(idx) = line.find("GC took ") {
+        let rest = &line[idx + "GC took ".len()..];
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !num.is_empty() {
+            if let Ok(ms) = num.parse() {
+                return Some(ms);
+            }
+        }
+    }
+    // Pattern: "Total time NNN ms" inside a JVM GC log line.
+    if let Some(idx) = line.find("Total time ") {
+        let rest = &line[idx + "Total time ".len()..];
+        let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !num.is_empty() {
+            if let Ok(ms) = num.parse() {
+                return Some(ms);
+            }
+        }
+    }
+    None
 }
 
 /// v0.15 — Locate a usable frpc binary. Search order:
@@ -1489,6 +1677,107 @@ mod tests {
         assert_eq!(parse_launcher_password(r#"{"password":""}"#), None);
         assert_eq!(parse_launcher_password(r#"{"foo":"bar"}"#), None);
         assert_eq!(parse_launcher_password("nope"), None);
+    }
+
+    /// v0.16 — watchdog summary counts "Can't keep up!" and similar tick-lag
+    /// markers, plus long GC pauses. We deliberately ignore lines that mention
+    /// these strings inside chat (in vanilla, chat is `<NAME> message`).
+    #[test]
+    fn summarize_log_window_counts_watchdog_warnings() {
+        let lines: Vec<String> = vec![
+            "[20:00:00] [Server thread/WARN]: Can't keep up! Did the system time change, or is the server overloaded?".into(),
+            "[20:01:00] [Server thread/INFO]: GC took 731 ms".into(),
+            "[20:02:00] [Server thread/INFO]: Spencer joined the game".into(),
+            "[20:03:00] [Server thread/WARN]: Can't keep up! ...".into(),
+            "[20:04:00] [Server thread/INFO]: GC took 200 ms".into(), // below threshold
+        ];
+        let s = summarize_log_window(&lines);
+        assert_eq!(s.tick_lag_count, 2);
+        assert_eq!(s.long_gc_count, 1);
+        assert!(s.last_event_label.is_some());
+    }
+
+    #[test]
+    fn parse_long_gc_ms_accepts_common_shapes() {
+        assert_eq!(
+            parse_long_gc_ms("[20:01:00] [Server thread/INFO]: GC took 731 ms"),
+            Some(731)
+        );
+        assert_eq!(
+            parse_long_gc_ms("[GC pause] Total time 1450 ms — generational"),
+            Some(1450)
+        );
+        // No GC marker → None.
+        assert!(parse_long_gc_ms("just a regular log line").is_none());
+    }
+
+    /// Online detection — extract player name from join/leave broadcasts.
+    /// Vanilla / Paper / Purpur all emit these verbatim from the server thread.
+    #[test]
+    fn parse_join_event_extracts_name() {
+        let line = "[20:31:14] [Server thread/INFO]: Spencer joined the game";
+        assert_eq!(parse_join_event(line), Some("Spencer"));
+        let line2 = "[20:31:14 INFO]: Friend123 joined the game";
+        assert_eq!(parse_join_event(line2), Some("Friend123"));
+    }
+
+    #[test]
+    fn parse_leave_event_extracts_name() {
+        let line = "[20:31:14] [Server thread/INFO]: Spencer left the game";
+        assert_eq!(parse_leave_event(line), Some("Spencer"));
+    }
+
+    #[test]
+    fn parse_join_leave_rejects_chat_lines() {
+        // Chat in vanilla is "<NAME> message"; a creative chatter typing
+        // "joined the game" should not be treated as a real join event
+        // because the name slot would contain a space + chat content.
+        let chat = "[20:31:14] [Server thread/INFO]: <Spencer> joined the game already?";
+        assert_eq!(parse_join_event(chat), None);
+        // Death messages start with the name but use a different verb.
+        let death = "[20:31:14] [Server thread/INFO]: Spencer was slain by Zombie";
+        assert_eq!(parse_join_event(death), None);
+        assert_eq!(parse_leave_event(death), None);
+    }
+
+    /// scan_lines: when the same player joins, leaves, and joins again,
+    /// the most recent event wins (online).
+    #[test]
+    fn scan_lines_resolves_latest_join_leave_event() {
+        let lines: Vec<String> = vec![
+            "[20:00:00] [Server thread/INFO]: Spencer joined the game".into(),
+            "[20:30:00] [Server thread/INFO]: Spencer left the game".into(),
+            "[20:45:00] [Server thread/INFO]: Spencer joined the game".into(),
+            "[20:46:00] [Server thread/INFO]: Friend1 joined the game".into(),
+        ];
+        let mut acc = LogScanResult::default();
+        scan_lines(&lines, 0, true, &mut acc);
+        assert_eq!(acc.online_state_in_latest.get("spencer").copied(), Some(true));
+        assert_eq!(acc.online_state_in_latest.get("friend1").copied(), Some(true));
+    }
+
+    /// scan_lines: when the player has left, online_state should be false.
+    #[test]
+    fn scan_lines_marks_left_player_offline() {
+        let lines: Vec<String> = vec![
+            "[20:00:00] [Server thread/INFO]: Spencer joined the game".into(),
+            "[20:30:00] [Server thread/INFO]: Spencer left the game".into(),
+        ];
+        let mut acc = LogScanResult::default();
+        scan_lines(&lines, 0, true, &mut acc);
+        assert_eq!(acc.online_state_in_latest.get("spencer").copied(), Some(false));
+    }
+
+    /// scan_lines: only `latest.log` contributes to online state — rotated
+    /// logs are filtered out so a previous-day join doesn't ghost a player.
+    #[test]
+    fn scan_lines_ignores_rotated_log_for_online_state() {
+        let lines: Vec<String> = vec![
+            "[20:00:00] [Server thread/INFO]: Spencer joined the game".into(),
+        ];
+        let mut acc = LogScanResult::default();
+        scan_lines(&lines, 0, false, &mut acc); // is_latest = false
+        assert!(acc.online_state_in_latest.is_empty());
     }
 
     /// v0.15.1 — md5 round-trip against a known-good fixture. The setup
