@@ -13,8 +13,8 @@ use ratatui::{
 };
 
 use crate::data::{
-    detect_interfaces, fmt_bytes, get_property, nic_kind_color, nic_kind_label, rcon_settings,
-    NicInfo, NicKind, YamlDisplay,
+    detect_interfaces, fmt_bytes, get_property, nic_kind_color, nic_kind_label, NicInfo, NicKind,
+    YamlDisplay,
 };
 use crate::i18n::{
     fmt_log_read_error, fmt_status_running, hint_for, property_metadata, property_zh,
@@ -23,115 +23,103 @@ use crate::i18n::{
 use crate::{App, InputPrompt, TabId, YamlView, SERVER_ACTIONS, TABS};
 
 pub fn ui(f: &mut Frame, app: &mut App) {
+    // Compact chrome: header + tabs each take a single line (no border boxes).
+    // Saves ~6 vertical lines compared to the old 3+3+3 layout, leaving the
+    // content pane breathing room on small terminals.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // status bar
-            Constraint::Length(3), // join bar (always-visible primary connect chip)
-            Constraint::Length(3), // tabs
+            Constraint::Length(1), // header: status + level + dir + primary connect chip
+            Constraint::Length(1), // tabs
             Constraint::Min(3),    // content
             Constraint::Length(3), // hints / status line
         ])
         .split(f.area());
 
-    draw_status_bar(f, chunks[0], app);
-    draw_join_bar(f, chunks[1], app);
-    draw_tabs(f, chunks[2], app);
-    app.tabs_rect = chunks[2];
-    app.list_rect = chunks[3];
+    draw_header_line(f, chunks[0], app);
+    draw_tabs(f, chunks[1], app);
+    app.tabs_rect = chunks[1];
+    app.list_rect = chunks[2];
     match app.tab {
-        TabId::Worlds => draw_worlds(f, chunks[3], app),
-        TabId::Whitelist => draw_whitelist(f, chunks[3], app),
-        TabId::Ops => draw_ops(f, chunks[3], app),
-        TabId::Config => draw_config(f, chunks[3], app),
-        TabId::Logs => draw_logs(f, chunks[3], app),
-        TabId::Yaml => draw_yaml(f, chunks[3], app),
-        TabId::Backups => draw_backups(f, chunks[3], app),
-        TabId::Rcon => draw_rcon(f, chunks[3], app),
-        TabId::Server => draw_server(f, chunks[3], app),
+        TabId::Worlds => draw_worlds(f, chunks[2], app),
+        TabId::Whitelist => draw_whitelist(f, chunks[2], app),
+        TabId::Ops => draw_ops(f, chunks[2], app),
+        TabId::Config => draw_config(f, chunks[2], app),
+        TabId::Logs => draw_logs(f, chunks[2], app),
+        TabId::Yaml => draw_yaml(f, chunks[2], app),
+        TabId::Backups => draw_backups(f, chunks[2], app),
+        TabId::Server => draw_server(f, chunks[2], app),
     }
-    draw_hints(f, chunks[4], app);
+    draw_hints(f, chunks[3], app);
 
     if let Some(prompt) = app.prompt.clone() {
         draw_prompt(f, &prompt, app.lang);
     }
 }
 
-fn draw_status_bar(f: &mut Frame, area: Rect, app: &App) {
+/// One-line header: status + level + dir + primary connect chip.
+/// No border — saves vertical space and keeps key info above the tab bar.
+/// Click the chip to copy `<ip>:<port>` to the clipboard via wl-copy.
+fn draw_header_line(f: &mut Frame, area: Rect, app: &mut App) {
+    use unicode_width::UnicodeWidthStr;
+
     let s = app.lang.s();
     let pid_text = match app.pid {
         Some(p) => Span::styled(fmt_status_running(app.lang, p), Style::default().fg(Color::Green)),
         None => Span::styled(s.status_stopped, Style::default().fg(Color::DarkGray)),
     };
-    let line = Line::from(vec![
-        Span::styled(s.server_label, Style::default().add_modifier(Modifier::DIM)),
-        pid_text,
-        Span::raw("    "),
-        Span::styled(s.level_label, Style::default().add_modifier(Modifier::DIM)),
-        Span::styled(app.current_level().to_string(), Style::default().fg(Color::Cyan)),
-        Span::raw("    "),
-        Span::styled(s.dir_label, Style::default().add_modifier(Modifier::DIM)),
-        Span::raw(app.server_dir.display().to_string()),
-    ]);
-    let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL).title(" mc-tui "));
-    f.render_widget(p, area);
-}
 
-/// Always-visible primary connect address (typically the ZeroTier one).
-/// Click the chip to copy `<ip>:<port>` to the clipboard via wl-copy.
-fn draw_join_bar(f: &mut Frame, area: Rect, app: &mut App) {
     let nics = detect_interfaces();
     let port: u16 = get_property(&app.properties, "server-port")
         .and_then(|v| v.parse().ok())
         .unwrap_or(25565);
-
-    // Pick the most "tell-friends-this-one" interface. nic_kind_priority orders
-    // ZeroTier first, then LAN, then Public, etc. Skip Loopback / Docker / TUN.
     let primary = nics.iter().find(|n| {
-        !matches!(
-            n.kind,
-            NicKind::Loopback | NicKind::Docker | NicKind::Tun
-        )
+        !matches!(n.kind, NicKind::Loopback | NicKind::Docker | NicKind::Tun)
     });
 
     app.join_chips.clear();
 
-    let inner_x = area.x.saturating_add(1);
-    let inner_y = area.y.saturating_add(1);
-
-    let mut spans: Vec<Span> = Vec::new();
-    spans.push(Span::raw(" "));
-
-    let label_lang = app.lang;
-    let title = match app.lang {
-        Lang::En => " Join — click to copy ",
-        Lang::Zh => " 连接地址（点击复制）",
-    };
+    // Build the line as spans; track chip x by accumulating display widths.
+    let sep = "   ";
+    let mut spans: Vec<Span> = vec![
+        Span::styled(s.server_label, Style::default().add_modifier(Modifier::DIM)),
+        pid_text,
+        Span::raw(sep),
+        Span::styled(s.level_label, Style::default().add_modifier(Modifier::DIM)),
+        Span::styled(app.current_level().to_string(), Style::default().fg(Color::Cyan)),
+        Span::raw(sep),
+        Span::styled(s.dir_label, Style::default().add_modifier(Modifier::DIM)),
+        Span::raw(app.server_dir.display().to_string()),
+        Span::raw(sep),
+    ];
 
     if let Some(n) = primary {
+        let kind_label = nic_kind_label(app.lang, n.kind);
+        let kind_span_text = format!("[{}]", kind_label);
         let chip_text = format!("{}:{}", n.ip, port);
-        let kind_label = nic_kind_label(label_lang, n.kind);
 
-        // Layout: " [<kind>] <ip>:<port> "
-        spans.push(Span::styled(
-            format!("[{}]", kind_label),
-            Style::default().fg(nic_kind_color(n.kind)).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" "));
-
-        // Track chip rect (x..x+chip_text.len(), y=inner_y) for mouse hit-testing.
-        let mut chip_x = inner_x + 1; // " "
-        chip_x += format!("[{}]", kind_label).chars().count() as u16;
-        chip_x += 1; // " "
-        let chip_w = chip_text.chars().count() as u16;
+        // Sum the display width of every span before the chip — that's where the
+        // chip starts on screen. UnicodeWidthStr handles wide CJK + emoji correctly.
+        let mut chip_x = area.x;
+        for sp in &spans {
+            chip_x = chip_x.saturating_add(UnicodeWidthStr::width(sp.content.as_ref()) as u16);
+        }
+        chip_x = chip_x.saturating_add(UnicodeWidthStr::width(kind_span_text.as_str()) as u16);
+        chip_x = chip_x.saturating_add(1); // space between [kind] and chip
+        let chip_w = UnicodeWidthStr::width(chip_text.as_str()) as u16;
         let chip_rect = Rect {
             x: chip_x,
-            y: inner_y,
+            y: area.y,
             width: chip_w,
             height: 1,
         };
         app.join_chips.push((chip_rect, chip_text.clone()));
 
+        spans.push(Span::styled(
+            kind_span_text,
+            Style::default().fg(nic_kind_color(n.kind)).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
         spans.push(Span::styled(
             chip_text,
             Style::default()
@@ -141,15 +129,14 @@ fn draw_join_bar(f: &mut Frame, area: Rect, app: &mut App) {
     } else {
         spans.push(Span::styled(
             match app.lang {
-                Lang::En => "(no LAN/Public/ZeroTier IPv4 detected)",
-                Lang::Zh => "(没检测到 LAN/Public/ZeroTier IPv4)",
+                Lang::En => "(no LAN/Public/ZeroTier IPv4)",
+                Lang::Zh => "(无可用 IPv4)",
             },
             Style::default().fg(Color::DarkGray),
         ));
     }
 
-    let p = Paragraph::new(Line::from(spans))
-        .block(Block::default().borders(Borders::ALL).title(title));
+    let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
 
@@ -163,7 +150,6 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     let selected = TABS.iter().position(|(t, _)| *t == app.tab).unwrap_or(0);
     let tabs = Tabs::new(titles)
-        .block(Block::default().borders(Borders::ALL))
         .select(selected)
         .style(Style::default().fg(Color::White))
         .highlight_style(
@@ -639,52 +625,6 @@ pub fn fmt_age(d: chrono::Duration) -> String {
     } else {
         format!("{}mo ago", total_secs / (86400 * 30))
     }
-}
-
-fn draw_rcon(f: &mut Frame, area: Rect, app: &mut App) {
-    let s = app.lang.s();
-    let enabled = rcon_settings(&app.properties).is_some();
-    if !enabled {
-        let p = Paragraph::new(Line::from(Span::styled(
-            s.rcon_disabled_in_props,
-            Style::default().fg(Color::Yellow),
-        )))
-        .block(Block::default().borders(Borders::ALL).title(s.title_rcon))
-        .wrap(Wrap { trim: false });
-        f.render_widget(p, area);
-        return;
-    }
-    let items: Vec<ListItem> = if app.rcon_history.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            s.rcon_history_empty,
-            Style::default().fg(Color::DarkGray),
-        )))]
-    } else {
-        app.rcon_history
-            .iter()
-            .flat_map(|(cmd, resp)| {
-                let mut out = vec![ListItem::new(Line::from(vec![
-                    Span::styled(" $ ", Style::default().fg(Color::Green)),
-                    Span::styled(cmd.clone(), Style::default().fg(Color::White)),
-                ]))];
-                for line in resp.lines() {
-                    out.push(ListItem::new(Line::from(vec![
-                        Span::styled(
-                            format!(" {} ", s.rcon_response_label),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(line.to_string(), Style::default().fg(Color::Cyan)),
-                    ])));
-                }
-                out
-            })
-            .collect()
-    };
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(s.title_rcon))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut app.rcon_state);
 }
 
 fn draw_server(f: &mut Frame, area: Rect, app: &mut App) {

@@ -6,7 +6,7 @@ A small TUI (terminal UI) manager for a local Minecraft Paper / Purpur server.
 
 ## What it does
 
-Manages the boring parts of running a friend-group Minecraft server without leaving the terminal. Nine tabs:
+Manages the boring parts of running a friend-group Minecraft server without leaving the terminal. Eight tabs:
 
 - **1 Worlds** — list every world directory under your server dir, see which is current, switch the active level by writing `level-name`. `N` creates a new world (writes the new name; the server generates the dir on next start).
 - **2 Whitelist** — add / remove players. Offline-mode UUID is computed automatically (`md5("OfflinePlayer:" + name)`).
@@ -15,8 +15,7 @@ Manages the boring parts of running a friend-group Minecraft server without leav
 - **5 Logs** — tail `logs/latest.log`.
 - **6 YAML** — pick a Paper/Purpur YAML (`paper-global.yml`, `purpur.yml`, etc.), enter the file, navigate the flattened tree, edit leaf scalars in place.
 - **7 Backups** — list archives in `<server-dir>/backups`, `../backups`, `../mc-backups`, `../<name>-backups`. Newest-first with size + age columns.
-- **8 RCON** — interactive console to a running server (needs `enable-rcon=true` + `rcon.password` in `server.properties`). `i` opens an input prompt.
-- **9 Server (运维)** — restart now, run `backup.sh`, schedule a daily restart / backup as a `systemd --user` timer, pre-generate chunks via RCON to `chunky`, show the `tmux attach` command. The top of this tab also lists every IPv4 interface (ZeroTier first).
+- **8 Server (运维)** — restart now, run `backup.sh`, schedule a daily restart / backup as a `systemd --user` timer, pre-generate chunks via `tmux send-keys` to the server console (`chunky` plugin), show the `tmux attach` command. The top of this tab also lists every IPv4 interface (ZeroTier first).
 
 Plus an always-visible **join address bar** between the status row and the tab bar — click the chip to copy `<ip>:<port>` to the clipboard via `wl-copy`.
 
@@ -95,7 +94,6 @@ mc-tui screenshot --tab worlds --lang zh --width 130 --height 32
 | `X` | Stop server (sends `stop` to the tmux console) |
 | `D` | Switch `--server-dir` at runtime |
 | `L` | Toggle 中 / EN |
-| `i` | Send RCON command (RCON tab) |
 | `r` | Refresh from disk |
 | `q` / `Esc` | Quit |
 | Mouse | Click tab bar, list rows, or the join chip (chip → wl-copy) |
@@ -112,8 +110,8 @@ When a prompt is open: type the value, `Enter` to confirm, `Esc` to cancel.
 - **Logs tab — read-only**: tails `logs/latest.log`.
 - **YAML tab — edit leaf**: full read → mutate `serde_yaml::Value` → write the file. Keeps key order. Preserves nested structure.
 - **Backups tab**: read-only display; restore is intentionally not automated (do it by hand to avoid surprises).
-- **RCON tab**: sync TCP, packet framing per [wiki.vg/RCON](https://wiki.vg/RCON). Honors `enable-rcon` / `rcon.port` / `rcon.password`; binds to `127.0.0.1` when `server-ip` is empty / `0.0.0.0`.
 - **Server tab — Restart now**: `tmux send-keys stop Enter` → poll for pid disappearance up to 30 s → `tmux new-session` to start.
+- **Server tab — Pre-gen chunks**: refuses if the tmux session is not alive; otherwise sends `chunky world <level>` / `chunky center 0 0` / `chunky radius <r>` / `chunky start` to the server console via `tmux send-keys`. Watch progress by attaching to the session.
 - **Server tab — Schedule daily restart/backup**: writes a pair of `~/.config/systemd/user/mc-tui-<kind>-<slug>.{service,timer}` files. mc-tui does **not** run `systemctl --user daemon-reload` for you; the status bar shows the exact command to copy.
 
 ## Server lifecycle
@@ -132,7 +130,7 @@ You can `tmux attach -t mc-tui-<slug>` from another terminal at any time to watc
 src/
 ├── main.rs    App state machine, run loop, mouse / event handlers, main(), screenshot subcommand.
 ├── cli.rs     Cli + Cmd + ServerType + scaffold_new + Java/curl/Aikar/first-boot helpers.
-├── data.rs    Data structs + filesystem / network IO (worlds, whitelist, ops, properties, backups, YAML walker, RCON client, NIC discovery, sticky pid detection).
+├── data.rs    Data structs + filesystem / network IO (worlds, whitelist, ops, properties, backups, YAML walker, NIC discovery, sticky pid detection).
 ├── i18n.rs    Lang + Strings struct + EN/ZH consts + fmt_* parametric helpers + property_zh annotations + PropertyMeta lookup table.
 ├── sys.rs     state.toml persistence, tmux session helpers, POSIX shell quote, path/tilde helpers.
 └── ui.rs      Every ratatui draw_* function + ui() dispatcher + layout helpers.
@@ -171,14 +169,13 @@ The `screenshot` subcommand dumps one rendered frame to stdout as plain text usi
 
 ### Tests
 
-46 unit tests across:
+43 unit tests across:
 
 - Offline UUID format / version bits / determinism (`data.rs`)
 - `server.properties` round-trip (`data.rs`)
 - `whitelist.json` / `ops.json` round-trip + parse-error propagation + corruption guard (`data.rs`, `main.rs`)
 - `scan_worlds` placeholder behavior for pending `level-name` (`data.rs`)
 - Backup file recognition + scan (`data.rs`)
-- RCON settings + packet framing (`data.rs`)
 - YAML flatten / set / scalar parser (`data.rs`)
 - NIC classification + ZeroTier-first ordering (`data.rs`)
 - Java version parser + Aikar flags + Purpur URL builder + heap sizing (`cli.rs`)
@@ -228,15 +225,15 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 
 - [x] Edit `paper-global.yml` / `paper-world-defaults.yml` / `purpur.yml` (file picker → flat row editor).
 - [x] Backup tab — list archives in candidate directories, sorted newest-first.
-- [x] RCON bridge — `i` to send a command, history pane.
 - [x] Hover-detail panels for Worlds / Whitelist / Ops / Config (lists split 70/30, right side describes the selection).
+- [x] ~~RCON bridge — `i` to send a command, history pane.~~ Dropped post-v0.6 — `tmux attach` covers ad-hoc commands; pre-gen-chunks moved to `tmux send-keys`.
 
 ### v0.6 — server ops (shipped 2026-05-01)
 
 - [x] Restart-now action.
 - [x] Run-`backup.sh`-now action.
 - [x] Schedule daily restart / backup via `systemd --user` timer.
-- [x] Pre-generate chunks via RCON to `chunky`.
+- [x] Pre-generate chunks via `tmux send-keys` to the server console (`chunky`).
 - [x] Always-visible join-address bar (ZeroTier-aware) + click-to-copy.
 - [x] `tmux attach` command exposed as a Server-tab action.
 
@@ -249,7 +246,6 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 ### Backlog (no version yet)
 
 - [ ] Backup restore action (with confirmation prompt + extract into a sibling dir, never overwrite the live world).
-- [ ] First-class i18n for plugin-specific RCON command sets.
 - [ ] More YAML schema awareness for `paper-global.yml` (right-side panel showing what each key does, mirrored from upstream docs).
 
 ## License

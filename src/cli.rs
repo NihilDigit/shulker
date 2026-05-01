@@ -49,7 +49,7 @@ pub enum Cmd {
     },
     /// Render one TUI frame to stdout as text (used for screenshot QA).
     Screenshot {
-        /// Tab to render: worlds | whitelist | ops | config | logs | backups | rcon | yaml | ops-panel.
+        /// Tab to render: worlds | whitelist | ops | config | logs | yaml | backups | server.
         #[arg(long, default_value = "worlds")]
         tab: String,
         /// Width in cells.

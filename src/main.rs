@@ -53,7 +53,6 @@ enum TabId {
     Logs,
     Yaml,
     Backups,
-    Rcon,
     Server,
 }
 
@@ -65,7 +64,6 @@ const TABS: &[(TabId, &str)] = &[
     (TabId::Logs, "Logs"),
     (TabId::Yaml, "YAML"),
     (TabId::Backups, "Backups"),
-    (TabId::Rcon, "RCON"),
     (TabId::Server, "Server"),
 ];
 
@@ -114,7 +112,6 @@ enum PromptAction {
     NewWorld,
     ChangeServerDir,
     EditYaml,
-    RconCommand,
     ScheduleDailyRestart,
     ScheduleDailyBackup,
     PreGenChunkRadius,
@@ -151,10 +148,6 @@ struct App {
     // v0.5 — Backups
     pub backups: Vec<BackupEntry>,
     pub backups_state: ListState,
-
-    // v0.5 — RCON
-    pub rcon_history: Vec<(String, String)>,
-    pub rcon_state: ListState,
 
     // v0.6 — Server ops
     pub server_state: ListState,
@@ -201,8 +194,6 @@ impl App {
             yaml_rows_state: ListState::default(),
             backups: Vec::new(),
             backups_state: ListState::default(),
-            rcon_history: Vec::new(),
-            rcon_state: ListState::default(),
             server_state: ListState::default(),
             status: match lang {
                 Lang::En => String::from("Ready."),
@@ -289,7 +280,6 @@ impl App {
                 YamlView::Editing { .. } => &mut self.yaml_rows_state,
             },
             TabId::Backups => &mut self.backups_state,
-            TabId::Rcon => &mut self.rcon_state,
             TabId::Server => &mut self.server_state,
         }
     }
@@ -306,7 +296,6 @@ impl App {
                 YamlView::Editing { .. } => self.yaml_rows.len(),
             },
             TabId::Backups => self.backups.len(),
-            TabId::Rcon => self.rcon_history.len(),
             TabId::Server => SERVER_ACTIONS.len(),
         }
     }
@@ -530,45 +519,6 @@ impl App {
         Ok(())
     }
 
-    // -- v0.5: RCON --
-
-    fn rcon_send(&mut self, cmd: &str) -> Result<()> {
-        let cmd = cmd.trim();
-        if cmd.is_empty() {
-            return Ok(());
-        }
-        if self.pid.is_none() {
-            self.status = self.lang.s().server_pregen_no_running.into();
-            return Ok(());
-        }
-        let Some((host, port, password)) = rcon_settings(&self.properties) else {
-            self.status = self.lang.s().rcon_disabled_in_props.into();
-            return Ok(());
-        };
-        match RconClient::connect(&host, port, &password)
-            .and_then(|mut c| c.exec(cmd))
-        {
-            Ok(resp) => {
-                self.rcon_history.push((cmd.to_string(), resp));
-                self.status = match self.lang {
-                    Lang::En => "✓ RCON ok".into(),
-                    Lang::Zh => "✓ RCON 已执行".into(),
-                };
-            }
-            Err(e) => {
-                self.status = match self.lang {
-                    Lang::En => format!("✗ RCON: {}", e),
-                    Lang::Zh => format!("✗ RCON 失败：{}", e),
-                };
-            }
-        }
-        // Auto-scroll to last entry.
-        if !self.rcon_history.is_empty() {
-            self.rcon_state.select(Some(self.rcon_history.len() - 1));
-        }
-        Ok(())
-    }
-
     // -- v0.6: Server ops --
 
     fn backup_now(&mut self) -> Result<()> {
@@ -715,45 +665,56 @@ impl App {
             self.status = self.lang.s().server_pregen_no_running.into();
             return Ok(());
         }
-        let Some((host, port, password)) = rcon_settings(&self.properties) else {
-            self.status = self.lang.s().rcon_disabled_in_props.into();
+        let session = tmux_session_name(&self.server_dir);
+        if which("tmux").is_none() || !tmux_session_alive(&session) {
+            self.status = match self.lang {
+                Lang::En => format!(
+                    "✗ tmux session '{}' is not alive — start the server with S first.",
+                    session
+                ),
+                Lang::Zh => format!("✗ tmux 会话 '{}' 不存在 — 请先按 S 启动服务器。", session),
+            };
             return Ok(());
-        };
-        let mut client = match RconClient::connect(&host, port, &password) {
-            Ok(c) => c,
-            Err(e) => {
-                self.status = match self.lang {
-                    Lang::En => format!("✗ RCON connect: {}", e),
-                    Lang::Zh => format!("✗ RCON 连接失败：{}", e),
-                };
-                return Ok(());
-            }
-        };
-        // Try chunky first (most efficient); fall back to vanilla worldborder.
+        }
         let level = self.current_level().to_string();
-        let cmds = vec![
+        let cmds = [
             format!("chunky world {}", level),
-            format!("chunky center 0 0"),
+            "chunky center 0 0".to_string(),
             format!("chunky radius {}", radius),
-            format!("chunky start"),
+            "chunky start".to_string(),
         ];
-        let mut log = String::new();
+        use std::process::Command;
         for c in &cmds {
-            match client.exec(c) {
-                Ok(r) => log.push_str(&format!("$ {}\n{}\n", c, r)),
+            let res = Command::new("tmux")
+                .args(["send-keys", "-t", &session, c, "Enter"])
+                .status();
+            match res {
+                Ok(s) if s.success() => {}
+                Ok(s) => {
+                    self.status = match self.lang {
+                        Lang::En => format!("✗ tmux send-keys exited {:?}", s.code()),
+                        Lang::Zh => format!("✗ tmux send-keys 退出码 {:?}", s.code()),
+                    };
+                    return Ok(());
+                }
                 Err(e) => {
-                    log.push_str(&format!("$ {} → ERR {}\n", c, e));
-                    break;
+                    self.status = match self.lang {
+                        Lang::En => format!("✗ tmux send-keys: {}", e),
+                        Lang::Zh => format!("✗ tmux send-keys 失败：{}", e),
+                    };
+                    return Ok(());
                 }
             }
         }
-        self.rcon_history.push(("(pre-gen chunks)".into(), log));
-        if !self.rcon_history.is_empty() {
-            self.rcon_state.select(Some(self.rcon_history.len() - 1));
-        }
         self.status = match self.lang {
-            Lang::En => format!("✓ Pre-gen sent (radius {}). Watch RCON tab for progress.", radius),
-            Lang::Zh => format!("✓ 已发送区块预加载（半径 {}）。在 RCON 页查看进度。", radius),
+            Lang::En => format!(
+                "✓ Pre-gen sent (radius {}). Attach with `tmux attach -t {}` to watch.",
+                radius, session
+            ),
+            Lang::Zh => format!(
+                "✓ 已发送区块预加载（半径 {}）。`tmux attach -t {}` 查看进度。",
+                radius, session
+            ),
         };
         Ok(())
     }
@@ -1027,10 +988,6 @@ impl App {
         self.yaml_rows_state = ListState::default();
         self.yaml_files_state = ListState::default();
 
-        // RCON history is per-server; clear it.
-        self.rcon_history.clear();
-        self.rcon_state = ListState::default();
-
         self.backups_state = ListState::default();
         self.server_state = ListState::default();
         self.server_state.select(Some(0));
@@ -1115,7 +1072,6 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                                 };
                             }
                         }
-                        PromptAction::RconCommand => app.rcon_send(&value)?,
                         PromptAction::ScheduleDailyRestart => {
                             app.schedule_daily(ServerAction::ScheduleDailyRestart, &value)?
                         }
@@ -1159,8 +1115,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             KeyCode::Char('5') => app.switch_tab(TabId::Logs),
             KeyCode::Char('6') => app.switch_tab(TabId::Yaml),
             KeyCode::Char('7') => app.switch_tab(TabId::Backups),
-            KeyCode::Char('8') => app.switch_tab(TabId::Rcon),
-            KeyCode::Char('9') => app.switch_tab(TabId::Server),
+            KeyCode::Char('8') => app.switch_tab(TabId::Server),
             KeyCode::Tab => app.cycle_tab(1),
             KeyCode::BackTab => app.cycle_tab(-1),
             KeyCode::Char('r') => {
@@ -1287,22 +1242,6 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     action: PromptAction::ChangeServerDir,
                 });
             }
-            // RCON: 'i' opens command prompt in RCON tab
-            KeyCode::Char('i') => {
-                if app.tab == TabId::Rcon {
-                    if rcon_settings(&app.properties).is_some() {
-                        let s = app.lang.s();
-                        app.prompt = Some(InputPrompt {
-                            title: s.rcon_prompt_title.into(),
-                            label: s.rcon_prompt_label.into(),
-                            buffer: String::new(),
-                            action: PromptAction::RconCommand,
-                        });
-                    } else {
-                        app.status = app.lang.s().rcon_disabled_in_props.into();
-                    }
-                }
-            }
             _ => {}
         }
     }
@@ -1381,8 +1320,8 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
 
     if rect_contains(app.tabs_rect, col, row) {
         // ratatui Tabs widget renders titles as " 1 Worlds " " │ " " 2 Whitelist " ...
-        // Compute cumulative widths to find which tab was clicked.
-        let inner_x = app.tabs_rect.x.saturating_add(1);
+        // No border now (single-row tab bar), so titles start at tabs_rect.x.
+        let inner_x = app.tabs_rect.x;
         if col < inner_x {
             return;
         }
@@ -1524,7 +1463,6 @@ fn render_screenshot(
         "logs" => TabId::Logs,
         "yaml" => TabId::Yaml,
         "backups" => TabId::Backups,
-        "rcon" => TabId::Rcon,
         "server" => TabId::Server,
         other => anyhow::bail!("unknown tab: {}", other),
     };
@@ -1783,56 +1721,6 @@ mod tests {
         for n in ["world.dat", "log.txt", "snap.tar"] {
             assert!(!is_backup_file(n), "expected {} NOT recognised", n);
         }
-    }
-
-    #[test]
-    fn rcon_settings_disabled_returns_none() {
-        let props = vec![
-            ("enable-rcon".into(), "false".into()),
-            ("rcon.port".into(), "25575".into()),
-            ("rcon.password".into(), "secret".into()),
-        ];
-        assert!(rcon_settings(&props).is_none());
-    }
-
-    #[test]
-    fn rcon_settings_enabled_returns_defaults() {
-        let props = vec![
-            ("enable-rcon".into(), "true".into()),
-            ("rcon.port".into(), "12345".into()),
-            ("rcon.password".into(), "hunter2".into()),
-            ("server-ip".into(), "".into()),
-        ];
-        let (host, port, pw) = rcon_settings(&props).unwrap();
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 12345);
-        assert_eq!(pw, "hunter2");
-    }
-
-    #[test]
-    fn rcon_packet_roundtrip_in_memory() {
-        // Verify our packet framing: build a packet, re-parse the header fields.
-        let body = b"list";
-        let id: i32 = 7;
-        let ty: i32 = RCON_TYPE_COMMAND;
-        let len: i32 = (10 + body.len()) as i32;
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&len.to_le_bytes());
-        packet.extend_from_slice(&id.to_le_bytes());
-        packet.extend_from_slice(&ty.to_le_bytes());
-        packet.extend_from_slice(body);
-        packet.push(0);
-        packet.push(0);
-        assert_eq!(packet.len(), 4 + len as usize);
-        let parsed_len = i32::from_le_bytes(packet[0..4].try_into().unwrap());
-        let parsed_id = i32::from_le_bytes(packet[4..8].try_into().unwrap());
-        let parsed_ty = i32::from_le_bytes(packet[8..12].try_into().unwrap());
-        assert_eq!(parsed_len, len);
-        assert_eq!(parsed_id, id);
-        assert_eq!(parsed_ty, ty);
-        // Body terminator
-        assert_eq!(packet[packet.len() - 1], 0);
-        assert_eq!(packet[packet.len() - 2], 0);
     }
 
     #[test]
