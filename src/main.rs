@@ -274,13 +274,10 @@ struct App {
     /// can roll back cleanly if the user cancels mid-flow.
     pub create_tunnel_draft: Option<CreateTunnelDraft>,
 
-    // v0.14 — per-tunnel enable/disable state pulled from the launcher's
-    // WebUI on https://127.0.0.1:7102. Map<tunnel_id, enabled>. Empty when
-    // the launcher isn't reachable (no docker, container down, password not
-    // discoverable) — UI then renders "?" markers. Cached password keeps us
-    // off the docker exec hot path on every refresh.
+    // v0.14.1 — per-tunnel enable/disable state read from the launcher's
+    // /run/config.json::auto_start_tunnels. Map<tunnel_id, enabled>. Empty
+    // when the launcher container isn't running — UI then renders ? markers.
     pub natfrp_tunnel_enabled: std::collections::HashMap<u64, bool>,
-    pub launcher_password: Option<String>,
 
     pub status: String,
     pub prompt: Option<InputPrompt>,
@@ -344,7 +341,6 @@ impl App {
             node_picker: None,
             create_tunnel_draft: None,
             natfrp_tunnel_enabled: HashMap::new(),
-            launcher_password: None,
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -549,64 +545,39 @@ impl App {
         self.refresh_launcher_state();
     }
 
-    /// v0.14 — pull per-tunnel state from the launcher's WebUI. Best effort:
-    /// we lazy-discover the password and silently degrade to "?" markers if
-    /// any step fails. Caller is `refresh_natfrp` (and post-toggle).
+    /// v0.14.1 — pull per-tunnel state by reading
+    /// `/run/config.json::auto_start_tunnels` from the launcher container.
+    /// Tunnels in the array → ▶ enabled, others → ■ disabled. Container
+    /// down or unreachable → empty map → ? markers. Pure read, no writes.
     fn refresh_launcher_state(&mut self) {
-        // Only meaningful if the launcher container is alive — saves a TLS
-        // handshake on every refresh when the user has docker stopped.
         if !matches!(self.sakurafrp_docker.state, data::DockerState::Running) {
             self.natfrp_tunnel_enabled.clear();
             return;
         }
-        if self.launcher_password.is_none() {
-            self.launcher_password =
-                data::read_launcher_password(&self.sakurafrp_container);
-        }
-        let Some(pw) = self.launcher_password.clone() else {
-            self.natfrp_tunnel_enabled.clear();
-            return;
-        };
-        let Ok(client) = natfrp::LauncherClient::new(pw) else {
-            return;
-        };
-        match client.tunnels_status() {
-            Ok(map) => self.natfrp_tunnel_enabled = map,
-            Err(_) => self.natfrp_tunnel_enabled.clear(),
+        let auto_start = data::read_launcher_auto_start(&self.sakurafrp_container);
+        // Map every known tunnel to a definitive bool, since auto_start is
+        // exhaustive — anything not in the list is effectively disabled.
+        self.natfrp_tunnel_enabled.clear();
+        let auto_set: std::collections::HashSet<u64> = auto_start.into_iter().collect();
+        for t in &self.natfrp_tunnels {
+            self.natfrp_tunnel_enabled
+                .insert(t.id, auto_set.contains(&t.id));
         }
     }
 
-    /// `e` pressed on a tunnel row — ask the launcher to enable it.
+    /// `e` pressed — add the selected tunnel id to auto_start_tunnels and
+    /// restart the launcher container so the new state is in effect.
     fn enable_selected_tunnel(&mut self) {
-        let Some(idx) = self.natfrp_state.selected() else {
-            self.status = self.lang.s().sf_no_selected_tunnel.to_string();
-            return;
-        };
-        let Some(t) = self.natfrp_tunnels.get(idx) else {
-            self.status = self.lang.s().sf_no_selected_tunnel.to_string();
-            return;
-        };
-        let id = t.id;
-        let name = t.name.clone();
-        let Some(client) = self.launcher_client_or_msg() else {
-            return;
-        };
-        match client.enable(id) {
-            Ok(()) => {
-                self.status = match self.lang {
-                    Lang::En => format!("✓ Enabled tunnel '{}' (id {}).", name, id),
-                    Lang::Zh => format!("✓ 已启用隧道 '{}' (id {})。", name, id),
-                };
-                self.refresh_launcher_state();
-            }
-            Err(e) => {
-                self.status = translate_natfrp_error(self.lang, &e);
-            }
-        }
+        self.toggle_selected_tunnel(true);
     }
 
-    /// `x` pressed on a tunnel row — ask the launcher to disable it.
+    /// `x` pressed — remove the selected tunnel id from auto_start_tunnels
+    /// and restart the launcher container.
     fn disable_selected_tunnel(&mut self) {
+        self.toggle_selected_tunnel(false);
+    }
+
+    fn toggle_selected_tunnel(&mut self, enable: bool) {
         let Some(idx) = self.natfrp_state.selected() else {
             self.status = self.lang.s().sf_no_selected_tunnel.to_string();
             return;
@@ -617,58 +588,69 @@ impl App {
         };
         let id = t.id;
         let name = t.name.clone();
-        let Some(client) = self.launcher_client_or_msg() else {
-            return;
-        };
-        match client.disable(id) {
-            Ok(()) => {
-                self.status = match self.lang {
-                    Lang::En => format!("✓ Disabled tunnel '{}' (id {}).", name, id),
-                    Lang::Zh => format!("✓ 已停用隧道 '{}' (id {})。", name, id),
-                };
-                self.refresh_launcher_state();
-            }
-            Err(e) => {
-                self.status = translate_natfrp_error(self.lang, &e);
-            }
-        }
-    }
-
-    /// Helper that tries to get a LauncherClient or sets a friendly status
-    /// explaining why we can't (no container / no password / TLS init failure).
-    fn launcher_client_or_msg(&mut self) -> Option<natfrp::LauncherClient> {
         if !matches!(self.sakurafrp_docker.state, data::DockerState::Running) {
             self.status = match self.lang {
-                Lang::En => {
-                    "✗ SakuraFrp launcher container not running — start it from the Server tab."
-                        .into()
-                }
+                Lang::En => "✗ SakuraFrp launcher container not running — start it from the Server tab.".into(),
                 Lang::Zh => "✗ SakuraFrp 启动器容器未运行 — 请到运维 tab 启动。".into(),
             };
-            return None;
+            return;
         }
-        if self.launcher_password.is_none() {
-            self.launcher_password =
-                data::read_launcher_password(&self.sakurafrp_container);
-        }
-        let Some(pw) = self.launcher_password.clone() else {
+        // Compute the new auto-start list. Add or remove `id`, preserving
+        // every other entry so we don't accidentally turn off some other
+        // tunnel the user owns.
+        let mut current = data::read_launcher_auto_start(&self.sakurafrp_container);
+        let already = current.iter().any(|x| *x == id);
+        if enable && already {
             self.status = match self.lang {
-                Lang::En => format!(
-                    "✗ Could not read launcher password from container '{}'. Check `docker logs {}` for the WebUI password and report back.",
-                    self.sakurafrp_container, self.sakurafrp_container
-                ),
-                Lang::Zh => format!(
-                    "✗ 无法从容器 '{}' 读取启动器密码。请运行 `docker logs {}` 看 WebUI 密码并反馈。",
-                    self.sakurafrp_container, self.sakurafrp_container
-                ),
+                Lang::En => format!("→ Tunnel '{}' is already enabled.", name),
+                Lang::Zh => format!("→ 隧道 '{}' 已是启用状态。", name),
             };
-            return None;
-        };
-        match natfrp::LauncherClient::new(pw) {
-            Ok(c) => Some(c),
+            return;
+        }
+        if !enable && !already {
+            self.status = match self.lang {
+                Lang::En => format!("→ Tunnel '{}' is already disabled.", name),
+                Lang::Zh => format!("→ 隧道 '{}' 已是停用状态。", name),
+            };
+            return;
+        }
+        if enable {
+            current.push(id);
+            current.sort_unstable();
+            current.dedup();
+        } else {
+            current.retain(|x| *x != id);
+        }
+        match data::write_launcher_auto_start(&self.sakurafrp_container, &current) {
+            Ok(()) => {
+                self.status = match (self.lang, enable) {
+                    (Lang::En, true) => format!(
+                        "✓ Enabled tunnel '{}' (id {}). Launcher container restarting (~10 s)…",
+                        name, id
+                    ),
+                    (Lang::En, false) => format!(
+                        "✓ Disabled tunnel '{}' (id {}). Launcher container restarting (~10 s)…",
+                        name, id
+                    ),
+                    (Lang::Zh, true) => format!(
+                        "✓ 已启用隧道 '{}' (id {})。启动器容器正在重启（约 10 秒）…",
+                        name, id
+                    ),
+                    (Lang::Zh, false) => format!(
+                        "✓ 已停用隧道 '{}' (id {})。启动器容器正在重启（约 10 秒）…",
+                        name, id
+                    ),
+                };
+                // Refresh container probe + auto-start cache.
+                self.sakurafrp_docker =
+                    data::detect_sakurafrp_docker(&self.sakurafrp_container);
+                self.refresh_launcher_state();
+            }
             Err(e) => {
-                self.status = translate_natfrp_error(self.lang, &e);
-                None
+                self.status = match self.lang {
+                    Lang::En => format!("✗ Toggle failed: {}", e),
+                    Lang::Zh => format!("✗ 切换失败：{}", e),
+                };
             }
         }
     }

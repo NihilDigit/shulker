@@ -17,6 +17,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
 md-5 = "0.10"
+# v0.14.1 — used to HMAC the launcher's challenge for the local WebUI
+# auth flow (ilsf-1-response). Same RustCrypto family as `md-5`; tiny.
+sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 unicode-width = "0.2"

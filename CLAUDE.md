@@ -285,19 +285,18 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] Non-game-friendly node selection appends a dim warning to status (long-idle TCP can drop after ~30s).
 - [x] `screenshot --picker create|migrate` for QA without firing destructive ops.
 
-### v0.14 — SakuraFrp launcher single-tunnel lifecycle (shipped 2026-05-01)
+### v0.14 / v0.14.1 — SakuraFrp launcher single-tunnel lifecycle (shipped 2026-05-01)
 
-- [x] `LauncherClient` against `https://127.0.0.1:7102` with rustls + `NoVerifier` (localhost-only traffic, security-equivalent to a one-shot pin).
-- [x] `read_launcher_password` walks candidate paths (`/run/config.json` for current 3.1.x builds, plus older fallbacks) and pulls `remote_management_key` (with legacy aliases).
-- [x] App caches the launcher password + per-tunnel enable map; `refresh_natfrp` opportunistically populates it (silent failure → ▶/■/? markers in the tunnel rows).
-- [x] `e` enables / `x` disables the selected tunnel via best-effort REST verbs at `/api/tunnel/<id>/{enable,disable}`.
-- [x] `parse_launcher_tunnels` is shape-tolerant (array, `{tunnels: [...]}` envelope, or flat id→bool map) so we can iterate as the launcher's actual response shape gets pinned down.
+- [x] Read-side: `read_launcher_auto_start` pulls `/run/config.json::auto_start_tunnels` from the container and the SakuraFrp tab renders ▶/■/? markers per tunnel.
+- [x] Write-side (v0.14.1): `e` adds the selected tunnel id to `auto_start_tunnels`; `x` removes it. Both paths edit the config via `docker exec python3` and restart the launcher container (~10 s). Idempotent — no-ops a second `e` on an already-enabled tunnel.
+- [x] `parse_launcher_password` finds `webui_pass` (current 3.1.x), with fallbacks to older field names. Plaintext password — feeds `launcher_challenge_response` (HMAC-SHA256 of the `ilsf-1-challenge` token), validated against an RFC 4231 test vector and a stable-output test.
+- [x] `LauncherClient` exists as a future seam for v0.14.2 websocket / gRPC-Web bring-up; rustls + `NoVerifier` plumbed but currently unused (config-file approach makes the websocket optional). Deliberately marked `#[allow(dead_code)]` to make the v0.14.2 follow-up obvious.
 
-> **Known gap:** launcher 3.1 defaults `remote_management_auth_mode` to `nonce` (HMAC the server-provided nonce with `remote_management_key`); the current implementation sends a plain `Authorization: Bearer <key>` header that probably won't authenticate. Implementing the nonce dance is the obvious follow-up and was deferred so v0.14 could ship structurally.
+> **Why config-file instead of websocket-RPC:** the launcher's local control protocol is gRPC-Web protobuf with a private `.proto` schema (`UpdateTunnel` / `ReloadTunnels` / `StreamTunnels` are confirmed method names; field tags aren't documented). Reverse-engineering would have shipped a brittle client. Editing the durable on-disk state + container restart matches the user's existing `docker restart natfrp-service` muscle memory and works without a schema.
 
 ### Backlog (no version yet)
 
-- [ ] LauncherClient: implement nonce-based auth dance (`GET /api/nonce` → HMAC with `remote_management_key`), or detect+adopt the auth scheme advertised by `remote_management_auth_mode`.
+- [ ] v0.14.2 — wire the websocket bring-up: `wss://127.0.0.1:7102/launcher/control`, subprotocol `natfrp-launcher-grpc`, ilsf-1 handshake, then gRPC-Web protobuf. Avoids the 10 s container restart on `e`/`x`. Requires reverse-engineering the `.proto` (or upstream documentation).
 - [ ] Backup restore action (with confirmation prompt + extract into a sibling dir, never overwrite the live world).
 - [ ] More YAML schema awareness for `paper-global.yml` (right-side panel showing what each key does, mirrored from upstream docs).
 

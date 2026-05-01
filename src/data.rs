@@ -808,18 +808,15 @@ pub fn parse_docker_state(s: &str) -> DockerState {
     }
 }
 
-/// v0.14 — Pull the launcher's WebUI auth key out of its persisted config.
+/// v0.14 — Pull the launcher's WebUI password out of its persisted config.
 /// The natfrp.com/launcher image (v3.1.x as of 2026-05-01) keeps state at
-/// `/run/config.json` with the WebUI key in the `remote_management_key`
-/// field (base64-encoded HMAC key). We try a couple of older paths first
-/// in case a future image relocates it.
+/// `/run/config.json` with the password in `webui_pass`. Older images may
+/// have used different paths/fields, so we try a couple of fallbacks.
 ///
-/// Returns:
-///   `Some(key)` on first hit — the **base64 key**, not a plaintext password.
-///     Caller must implement whatever auth scheme the launcher version uses
-///     (`remote_management_auth_mode` in config; "nonce" by default in 3.1).
-///   `None` when the container isn't running, docker isn't on PATH, or no
-///   candidate path yields a parseable key.
+/// Returns the **plaintext password** the user would type into the WebUI's
+/// login screen. The local control protocol authenticates via
+/// `HMAC-SHA256(key=password, message=server_challenge)` — see
+/// `LauncherClient` in src/natfrp.rs.
 pub fn read_launcher_password(container: &str) -> Option<String> {
     use std::process::Command;
     const CANDIDATE_PATHS: &[&str] = &[
@@ -845,19 +842,24 @@ pub fn read_launcher_password(container: &str) -> Option<String> {
     None
 }
 
-/// Extract the WebUI auth key from the launcher's config blob. Field name
-/// has historically been `password` / `webui_password` / `WebPassword` /
-/// `WebUIPassword` in older builds; current natfrp.com/launcher (3.1.x)
-/// uses `remote_management_key` (base64-encoded HMAC key). We accept any of
-/// them rather than ship-and-pray.
+/// Extract the WebUI password from the launcher's config blob. Field name
+/// has shifted across launcher releases: 3.1.x calls it `webui_pass`; older
+/// builds used `password` / `webui_password` / `WebPassword` /
+/// `WebUIPassword`. We accept any of them. `remote_management_key` is the
+/// HMAC key for the *remote* management WebSocket (rm-api.natfrp.com), not
+/// the local one — listed last as a desperate fallback only.
 pub fn parse_launcher_password(body: &str) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(body).ok()?;
     for key in &[
-        "remote_management_key",
-        "password",
+        "webui_pass",
         "webui_password",
         "WebPassword",
         "WebUIPassword",
+        "password",
+        // Last-resort fallback. The remote management key is wrong for
+        // local auth but if the launcher ever consolidates them this still
+        // returns something rather than nothing.
+        "remote_management_key",
     ] {
         if let Some(s) = v.get(*key).and_then(|x| x.as_str()) {
             if !s.is_empty() {
@@ -866,6 +868,83 @@ pub fn parse_launcher_password(body: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Read `/run/config.json::auto_start_tunnels` — the persistent list of
+/// tunnel ids the launcher boots into the "running" state. Treated as the
+/// truth source for enable/disable since the launcher's gRPC schema isn't
+/// public and the auto-start flag is the durable property anyway. Returns
+/// empty when the container isn't reachable.
+pub fn read_launcher_auto_start(container: &str) -> Vec<u64> {
+    use std::process::Command;
+    const PATH: &str = "/run/config.json";
+    let Ok(out) = Command::new("docker")
+        .args(["exec", container, "cat", PATH])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    parse_auto_start(&String::from_utf8_lossy(&out.stdout))
+}
+
+pub fn parse_auto_start(body: &str) -> Vec<u64> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.get("auto_start_tunnels").and_then(|x| x.as_array()) else {
+        return Vec::new();
+    };
+    arr.iter().filter_map(|x| x.as_u64()).collect()
+}
+
+/// Write a new `auto_start_tunnels` list back into `/run/config.json` and
+/// restart the container so the launcher picks it up. Approach: docker exec
+/// a python3 one-liner that reads the file, mutates the array, writes it
+/// back atomically (config.json.bak → config.json swap), then `docker
+/// restart`. Container restart is on the order of 10 s and matches the
+/// user's existing `pkill sparkle && docker restart natfrp-service`
+/// muscle memory.
+///
+/// Returns Err if any step fails (read, write, restart). The caller should
+/// surface this verbatim — partial state is possible if the write succeeded
+/// but the restart failed, in which case the launcher will pick up the new
+/// list on its next start.
+pub fn write_launcher_auto_start(container: &str, ids: &[u64]) -> Result<()> {
+    use std::process::Command;
+    // Build the JSON array literal, then run a python3 one-liner inside
+    // the container to update the field. python3 is more reliable than sed
+    // for editing JSON, and it's already in the official launcher image.
+    let arr_json = serde_json::to_string(ids).context("serialize ids")?;
+    let script = format!(
+        r#"import json,sys
+with open('/run/config.json','r') as f: cfg=json.load(f)
+cfg['auto_start_tunnels']={}
+with open('/run/config.json.tmp','w') as f: json.dump(cfg,f,indent=4)
+import os
+os.replace('/run/config.json.tmp','/run/config.json')
+"#,
+        arr_json
+    );
+    let out = Command::new("docker")
+        .args(["exec", "-i", container, "python3", "-c", &script])
+        .output()
+        .with_context(|| format!("docker exec python3 in {}", container))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("rewrite config.json failed: {}", stderr.trim());
+    }
+    let restart = Command::new("docker")
+        .args(["restart", container])
+        .output()
+        .with_context(|| format!("docker restart {}", container))?;
+    if !restart.status.success() {
+        let stderr = String::from_utf8_lossy(&restart.stderr);
+        anyhow::bail!("docker restart failed: {}", stderr.trim());
+    }
+    Ok(())
 }
 
 /// Run `docker <verb> <container>` synchronously and return stdout/stderr in a
@@ -1181,17 +1260,19 @@ mod tests {
         assert!(!pgrep_matches("/nonexistent-bin-zzzzz", "sparkle"));
     }
 
-    /// v0.14 — accept the historical launcher field names without a second
-    /// release for each rename. `remote_management_key` is the current
-    /// (3.1.x) field; older field names kept for back-compat.
+    /// v0.14.1 — webui_pass (the actual local-WebUI password) wins over all
+    /// fallbacks. Verified against a real natfrp.com/launcher 3.1.7 container:
+    /// HMAC-SHA256(challenge, webui_pass) successfully completes the
+    /// `ilsf-1-challenge`/`ilsf-1-response` handshake on
+    /// `/launcher/control` with subprotocol `natfrp-launcher-grpc`.
     #[test]
-    fn parse_launcher_password_handles_field_aliases() {
-        // 3.1.x — base64 HMAC key
+    fn parse_launcher_password_prefers_webui_pass() {
+        // 3.1.x current path
         assert_eq!(
-            parse_launcher_password(r#"{"remote_management_key":"BASE64KEYHERE="}"#),
-            Some("BASE64KEYHERE=".to_string())
+            parse_launcher_password(r#"{"webui_pass":"realPW"}"#),
+            Some("realPW".to_string())
         );
-        // Older builds
+        // Older fallbacks
         assert_eq!(
             parse_launcher_password(r#"{"password":"abc"}"#),
             Some("abc".to_string())
@@ -1204,19 +1285,39 @@ mod tests {
             parse_launcher_password(r#"{"WebPassword":"PQR"}"#),
             Some("PQR".to_string())
         );
-        // Field-priority: remote_management_key wins over legacy `password`.
+        // Field priority: webui_pass beats anything else when present.
         assert_eq!(
             parse_launcher_password(
-                r#"{"remote_management_key":"new","password":"old"}"#
+                r#"{"remote_management_key":"K","webui_pass":"correct","password":"old"}"#
             ),
-            Some("new".to_string())
+            Some("correct".to_string())
+        );
+        // Last-resort fallback to remote_management_key still works.
+        assert_eq!(
+            parse_launcher_password(r#"{"remote_management_key":"R"}"#),
+            Some("R".to_string())
         );
         // Empty string is treated as "not configured", same as missing.
         assert_eq!(parse_launcher_password(r#"{"password":""}"#), None);
-        // Mismatched key
         assert_eq!(parse_launcher_password(r#"{"foo":"bar"}"#), None);
-        // Non-JSON
         assert_eq!(parse_launcher_password("nope"), None);
+    }
+
+    /// v0.14.1 — auto_start_tunnels is the source of truth for enable/disable
+    /// in the absence of a working gRPC client. Tolerate missing key / empty
+    /// list / malformed JSON without panicking; downstream UI just shows
+    /// `?` markers in those cases.
+    #[test]
+    fn parse_auto_start_handles_shapes() {
+        assert_eq!(parse_auto_start(r#"{"auto_start_tunnels":[1,2,3]}"#), vec![1, 2, 3]);
+        assert_eq!(parse_auto_start(r#"{"auto_start_tunnels":[]}"#), Vec::<u64>::new());
+        assert_eq!(parse_auto_start(r#"{}"#), Vec::<u64>::new());
+        assert_eq!(parse_auto_start("not json"), Vec::<u64>::new());
+        // Non-numeric entries (shouldn't happen but guard anyway)
+        assert_eq!(
+            parse_auto_start(r#"{"auto_start_tunnels":[1,"two",3]}"#),
+            vec![1, 3]
+        );
     }
 }
 
