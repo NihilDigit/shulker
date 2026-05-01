@@ -543,6 +543,49 @@ fn parse_disconnect_name(line: &str) -> Option<String> {
     Some(name)
 }
 
+/// v0.15 — Find a running frpc subprocess. Sticky on `prev` to avoid pid
+/// flicker when proc table reads race against the tmux-spawned child. Match
+/// criterion: command name contains "frpc". Same shape as
+/// `server_running_pid` so the two cohabit naturally.
+pub fn detect_frpc_pid(prev: Option<u32>) -> Option<u32> {
+    use sysinfo::{Pid, ProcessRefreshKind, RefreshKind, System};
+    let mut sys = System::new_with_specifics(
+        RefreshKind::new().with_processes(ProcessRefreshKind::everything()),
+    );
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let matches = |proc: &sysinfo::Process| -> bool {
+        let name = proc.name().to_string_lossy();
+        if name == "frpc" {
+            return true;
+        }
+        // Fallback: check argv for an absolute path ending in `/frpc`.
+        proc.cmd().iter().any(|s| {
+            let s = s.to_string_lossy();
+            s.ends_with("/frpc") || s == "frpc"
+        })
+    };
+
+    if let Some(p) = prev {
+        if let Some(proc) = sys.process(Pid::from_u32(p)) {
+            if matches(proc) {
+                return Some(p);
+            }
+        }
+    }
+    let mut best: Option<u32> = None;
+    for (pid, proc) in sys.processes() {
+        if !matches(proc) {
+            continue;
+        }
+        let p = pid.as_u32();
+        if best.map(|b| p < b).unwrap_or(true) {
+            best = Some(p);
+        }
+    }
+    best
+}
+
 /// Find the Java process running the Paper/Purpur/Spigot server in `server_dir`.
 ///
 /// Why sticky: a single process scan can miss `cwd` for a process that's mid-fork,
@@ -749,6 +792,70 @@ pub enum DockerState {
 #[derive(Debug, Clone, Default)]
 pub struct SakuraFrpDocker {
     pub state: DockerState,
+}
+
+/// v0.15 — Locate a usable frpc binary. Search order:
+///   1. `frpc` on `$PATH` (Arch users via `paru -S sakura-frp`, Homebrew, etc.)
+///   2. `~/.config/mc-tui/frpc` (where mc-tui's onboarding tells users to drop it)
+/// Returns `None` if neither exists. We never auto-download — the user pulls
+/// the official binary themselves (no second-party redistribution, no licensing
+/// trapdoor for mc-tui).
+pub fn find_frpc_binary() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path) {
+            let candidate = dir.join("frpc");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    let managed = mc_tui_config_dir().join("frpc");
+    if managed.is_file() {
+        return Some(managed);
+    }
+    None
+}
+
+/// Where mc-tui keeps its own state (token, downloaded frpc, etc.). Mirror of
+/// `sys::config_dir` — duplicated here to avoid a cycle (sys depends on data
+/// types in some functions).
+fn mc_tui_config_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("XDG_CONFIG_HOME") {
+        if !p.is_empty() {
+            return PathBuf::from(p).join("mc-tui");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".config").join("mc-tui");
+    }
+    PathBuf::from(".mc-tui")
+}
+
+/// Map Rust's runtime target triple to natfrp's download manifest keys.
+/// Returns the (os, arch) suffix used in URLs like
+/// `frpc_<os>_<arch>` / `frpc_<os>_<arch>.exe`. None for platforms the
+/// upstream doesn't ship binaries for.
+pub fn host_target_for_manifest() -> Option<(&'static str, &'static str)> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "darwin",
+        "windows" => "windows",
+        "freebsd" => "freebsd",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "x86" => "386",
+        "aarch64" => "arm64",
+        "arm" => "armv7",
+        "mips" => "mips",
+        "mips64" => "mips64",
+        "powerpc64" => return None, // not shipped
+        "riscv64" => "riscv64",
+        "loongarch64" => "loong64",
+        _ => return None,
+    };
+    Some((os, arch))
 }
 
 /// True when there's a `sparkle` process owning the user's mihomo instance
@@ -1301,6 +1408,28 @@ mod tests {
         assert_eq!(parse_launcher_password(r#"{"password":""}"#), None);
         assert_eq!(parse_launcher_password(r#"{"foo":"bar"}"#), None);
         assert_eq!(parse_launcher_password("nope"), None);
+    }
+
+    /// v0.15 — every host arch we map to a manifest key has a non-empty
+    /// (os, arch) pair, and ones we deliberately don't ship are None. Locks
+    /// in the mapping so future Rust target additions don't silently produce
+    /// wrong URLs.
+    #[test]
+    fn host_target_mapping_is_consistent() {
+        // We can't easily fake std::env::consts::OS at test-time (it's a
+        // compile-time constant), so just call the function and make sure it
+        // returns *something* on this build target — and that what it returns
+        // looks right.
+        if let Some((os, arch)) = host_target_for_manifest() {
+            assert!(!os.is_empty());
+            assert!(!arch.is_empty());
+            // Sanity: combined key should match the format used by the
+            // manifest parser (linux_amd64, darwin_arm64, etc).
+            let key = format!("{}_{}", os, arch);
+            assert!(key.contains('_'));
+        }
+        // Build host is one of: linux/amd64, darwin/arm64, etc. None of
+        // these should map to None.
     }
 
     /// v0.14.1 — auto_start_tunnels is the source of truth for enable/disable

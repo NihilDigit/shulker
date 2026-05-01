@@ -66,10 +66,13 @@ pub struct PersistedState {
     /// SakuraFrp tunnel public address (e.g. `frp-way.com:36192`). User-set
     /// via the Server tab prompt; rendered in join-info, click-to-copy.
     pub sakurafrp_address: Option<String>,
-    /// SakuraFrp launcher Docker container name. Defaults to `natfrp-service`
-    /// (matches the official launcher image's typical name). Used by Server
-    /// tab actions that probe / start / stop / restart the container.
+    /// SakuraFrp launcher Docker container name. v0.9-v0.14.1 used this to
+    /// manage the launcher container; v0.15 runs frpc directly. Field kept
+    /// so existing state.toml files don't error on read.
     pub sakurafrp_container: Option<String>,
+    /// v0.15 — comma-separated tunnel ids passed to `frpc -f`. The list of
+    /// tunnels mc-tui auto-starts when the user runs frpc; toggled by `e`/`x`.
+    pub frpc_enabled_ids: Vec<u64>,
 }
 
 pub fn read_persisted_state() -> PersistedState {
@@ -91,6 +94,17 @@ pub fn read_persisted_state() -> PersistedState {
                 "lang" => state.lang = Some(v),
                 "sakurafrp_address" => state.sakurafrp_address = Some(v),
                 "sakurafrp_container" => state.sakurafrp_container = Some(v),
+                "frpc_enabled_ids" => {
+                    // Comma-separated u64 list, e.g. "27014725,27014726".
+                    // Silently drops malformed entries — better than failing
+                    // the whole state load over a single typo.
+                    state.frpc_enabled_ids = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                }
                 _ => {}
             }
         }
@@ -115,6 +129,10 @@ pub fn write_persisted_state(state: &PersistedState) -> Result<()> {
     }
     if let Some(c) = &state.sakurafrp_container {
         s.push_str(&format!("sakurafrp_container = \"{}\"\n", c));
+    }
+    if !state.frpc_enabled_ids.is_empty() {
+        let joined: Vec<String> = state.frpc_enabled_ids.iter().map(u64::to_string).collect();
+        s.push_str(&format!("frpc_enabled_ids = \"{}\"\n", joined.join(",")));
     }
     fs::write(&path, s).with_context(|| format!("write {}", path.display()))?;
     Ok(())
@@ -195,6 +213,19 @@ pub fn which(prog: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// v0.15 — stable tmux session name for the frpc subprocess. Keyed off the
+/// server-dir slug so two mc-tui instances on different server-dirs don't
+/// fight over a single session.
+pub fn frpc_tmux_session_name(server_dir: &Path) -> String {
+    format!("mc-tui-frpc-{}", server_dir_slug(server_dir))
+}
+
+/// True when `frpc` is up under the tmux session for `server_dir`. Cheap;
+/// `tmux has-session` returns 0/1.
+pub fn frpc_tmux_alive(server_dir: &Path) -> bool {
+    tmux_session_alive(&frpc_tmux_session_name(server_dir))
 }
 
 pub fn expand_tilde(p: &str) -> PathBuf {

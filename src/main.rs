@@ -83,13 +83,11 @@ enum ServerAction {
     ShowAttachCommand,
     // v0.8 — surface the SakuraFrp tunnel address in the join-bar.
     SetSakuraFrpAddress,
-    // v0.9 — manage the SakuraFrp launcher Docker container directly.
-    // Container name persisted in state.toml (default `natfrp-service`).
-    SetSakuraFrpContainer,
-    SakuraFrpStart,
-    SakuraFrpStop,
-    SakuraFrpRestart,
-    SakuraFrpShowLogs,
+    // v0.15 — direct frpc lifecycle (replaces v0.9 docker container management).
+    FrpcStart,
+    FrpcStop,
+    FrpcRestart,
+    FrpcShowLogs,
 }
 
 const SERVER_ACTIONS: &[ServerAction] = &[
@@ -101,11 +99,10 @@ const SERVER_ACTIONS: &[ServerAction] = &[
     ServerAction::PreGenChunks,
     ServerAction::OpenSystemdStatus,
     ServerAction::SetSakuraFrpAddress,
-    ServerAction::SakuraFrpStart,
-    ServerAction::SakuraFrpStop,
-    ServerAction::SakuraFrpRestart,
-    ServerAction::SakuraFrpShowLogs,
-    ServerAction::SetSakuraFrpContainer,
+    ServerAction::FrpcStart,
+    ServerAction::FrpcStop,
+    ServerAction::FrpcRestart,
+    ServerAction::FrpcShowLogs,
 ];
 
 /// Default Docker container name for the SakuraFrp launcher image. The user
@@ -140,7 +137,6 @@ enum PromptAction {
     ScheduleDailyBackup,
     PreGenChunkRadius,
     SetSakuraFrpAddress,
-    SetSakuraFrpContainer,
     /// v0.10 — input the SakuraFrp API token. Persisted to natfrp.token (0600).
     SetNatfrpToken,
     // v0.13 — three-step tunnel-create flow. Each step pre-fills sensible
@@ -279,6 +275,18 @@ struct App {
     // when the launcher container isn't running — UI then renders ? markers.
     pub natfrp_tunnel_enabled: std::collections::HashMap<u64, bool>,
 
+    // v0.15 — direct frpc subprocess management. mc-tui now runs frpc itself
+    // (via tmux) instead of going through the SakuraFrp launcher container.
+    // Source-of-truth for "which tunnels are enabled" is `frpc_enabled_ids`,
+    // persisted in state.toml so it survives mc-tui restarts. `frpc_pid` is
+    // probed each refresh from the process table, sysinfo-style.
+    pub frpc_binary: Option<PathBuf>,
+    pub frpc_pid: Option<u32>,
+    pub frpc_enabled_ids: Vec<u64>,
+    /// Cached download manifest from `/v4/system/clients`. Populated lazily
+    /// the first time the user is told they need to fetch a binary.
+    pub clients_manifest: Option<natfrp::ClientsManifest>,
+
     pub status: String,
     pub prompt: Option<InputPrompt>,
 
@@ -341,6 +349,10 @@ impl App {
             node_picker: None,
             create_tunnel_draft: None,
             natfrp_tunnel_enabled: HashMap::new(),
+            frpc_binary: find_frpc_binary(),
+            frpc_pid: None,
+            frpc_enabled_ids: read_persisted_state().frpc_enabled_ids,
+            clients_manifest: None,
             status: match lang {
                 Lang::En => String::from("Ready."),
                 Lang::Zh => String::from("就绪。"),
@@ -411,6 +423,19 @@ impl App {
         self.backups = scan_backups(&self.server_dir);
         self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
         self.mihomo_running = mihomo_running();
+        // v0.15 — re-discover the frpc binary every refresh so the user can
+        // drop one in mid-session and not have to restart mc-tui. Cheap
+        // (PATH walk + one stat).
+        self.frpc_binary = find_frpc_binary();
+        // Only count frpc that mc-tui actually launched: gate on the tmux
+        // session being alive. Otherwise sysinfo would see frpc instances
+        // running inside someone else's container (e.g. natfrp-service)
+        // and falsely report Active.
+        self.frpc_pid = if sys::frpc_tmux_alive(&self.server_dir) {
+            detect_frpc_pid(self.frpc_pid)
+        } else {
+            None
+        };
         self.whitelist_enabled = get_property(&self.properties, "white-list")
             .map(|v| v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
@@ -545,34 +570,30 @@ impl App {
         self.refresh_launcher_state();
     }
 
-    /// v0.14.1 — pull per-tunnel state by reading
-    /// `/run/config.json::auto_start_tunnels` from the launcher container.
-    /// Tunnels in the array → ▶ enabled, others → ■ disabled. Container
-    /// down or unreachable → empty map → ? markers. Pure read, no writes.
+    /// v0.15 — populate `natfrp_tunnel_enabled` from `App.frpc_enabled_ids`.
+    /// Marker rules: tunnel id ∈ enabled list AND frpc running → ▶, in list
+    /// but frpc dead → ■ (configured but not active), otherwise ?. Caller
+    /// usually runs this from `refresh_natfrp` plus after each toggle.
     fn refresh_launcher_state(&mut self) {
-        if !matches!(self.sakurafrp_docker.state, data::DockerState::Running) {
-            self.natfrp_tunnel_enabled.clear();
-            return;
-        }
-        let auto_start = data::read_launcher_auto_start(&self.sakurafrp_container);
-        // Map every known tunnel to a definitive bool, since auto_start is
-        // exhaustive — anything not in the list is effectively disabled.
         self.natfrp_tunnel_enabled.clear();
-        let auto_set: std::collections::HashSet<u64> = auto_start.into_iter().collect();
+        let enabled_set: std::collections::HashSet<u64> =
+            self.frpc_enabled_ids.iter().copied().collect();
+        let frpc_alive = self.frpc_pid.is_some();
         for t in &self.natfrp_tunnels {
-            self.natfrp_tunnel_enabled
-                .insert(t.id, auto_set.contains(&t.id));
+            // ▶ requires both: configured AND frpc actually serving traffic.
+            // ■ when configured but frpc is down (tells the user "press S to start").
+            let enabled = enabled_set.contains(&t.id) && frpc_alive;
+            self.natfrp_tunnel_enabled.insert(t.id, enabled);
         }
     }
 
-    /// `e` pressed — add the selected tunnel id to auto_start_tunnels and
-    /// restart the launcher container so the new state is in effect.
+    /// `e` pressed — add the selected tunnel id to the auto-enable list,
+    /// persist, then bounce frpc so the change takes effect.
     fn enable_selected_tunnel(&mut self) {
         self.toggle_selected_tunnel(true);
     }
 
-    /// `x` pressed — remove the selected tunnel id from auto_start_tunnels
-    /// and restart the launcher container.
+    /// `x` pressed — remove the selected tunnel id and bounce frpc.
     fn disable_selected_tunnel(&mut self) {
         self.toggle_selected_tunnel(false);
     }
@@ -588,18 +609,7 @@ impl App {
         };
         let id = t.id;
         let name = t.name.clone();
-        if !matches!(self.sakurafrp_docker.state, data::DockerState::Running) {
-            self.status = match self.lang {
-                Lang::En => "✗ SakuraFrp launcher container not running — start it from the Server tab.".into(),
-                Lang::Zh => "✗ SakuraFrp 启动器容器未运行 — 请到运维 tab 启动。".into(),
-            };
-            return;
-        }
-        // Compute the new auto-start list. Add or remove `id`, preserving
-        // every other entry so we don't accidentally turn off some other
-        // tunnel the user owns.
-        let mut current = data::read_launcher_auto_start(&self.sakurafrp_container);
-        let already = current.iter().any(|x| *x == id);
+        let already = self.frpc_enabled_ids.contains(&id);
         if enable && already {
             self.status = match self.lang {
                 Lang::En => format!("→ Tunnel '{}' is already enabled.", name),
@@ -615,42 +625,216 @@ impl App {
             return;
         }
         if enable {
-            current.push(id);
-            current.sort_unstable();
-            current.dedup();
+            self.frpc_enabled_ids.push(id);
+            self.frpc_enabled_ids.sort_unstable();
+            self.frpc_enabled_ids.dedup();
         } else {
-            current.retain(|x| *x != id);
+            self.frpc_enabled_ids.retain(|x| *x != id);
         }
-        match data::write_launcher_auto_start(&self.sakurafrp_container, &current) {
+        if let Err(e) = self.persist_state() {
+            self.status = match self.lang {
+                Lang::En => format!("✗ Failed to persist state: {}", e),
+                Lang::Zh => format!("✗ 写入状态失败：{}", e),
+            };
+            return;
+        }
+        // Bounce frpc so the new enabled-list takes effect. If frpc isn't
+        // up yet, `restart_frpc` falls through to `start_frpc`.
+        let action_word_zh = if enable { "已启用" } else { "已停用" };
+        let action_word_en = if enable { "Enabled" } else { "Disabled" };
+        match self.restart_frpc() {
             Ok(()) => {
-                self.status = match (self.lang, enable) {
-                    (Lang::En, true) => format!(
-                        "✓ Enabled tunnel '{}' (id {}). Launcher container restarting (~10 s)…",
-                        name, id
+                self.status = match self.lang {
+                    Lang::En => format!(
+                        "✓ {} tunnel '{}' (id {}). frpc restarted.",
+                        action_word_en, name, id
                     ),
-                    (Lang::En, false) => format!(
-                        "✓ Disabled tunnel '{}' (id {}). Launcher container restarting (~10 s)…",
-                        name, id
-                    ),
-                    (Lang::Zh, true) => format!(
-                        "✓ 已启用隧道 '{}' (id {})。启动器容器正在重启（约 10 秒）…",
-                        name, id
-                    ),
-                    (Lang::Zh, false) => format!(
-                        "✓ 已停用隧道 '{}' (id {})。启动器容器正在重启（约 10 秒）…",
-                        name, id
+                    Lang::Zh => format!(
+                        "✓ {}隧道 '{}' (id {})。frpc 已重启。",
+                        action_word_zh, name, id
                     ),
                 };
-                // Refresh container probe + auto-start cache.
-                self.sakurafrp_docker =
-                    data::detect_sakurafrp_docker(&self.sakurafrp_container);
-                self.refresh_launcher_state();
             }
             Err(e) => {
                 self.status = match self.lang {
-                    Lang::En => format!("✗ Toggle failed: {}", e),
-                    Lang::Zh => format!("✗ 切换失败：{}", e),
+                    Lang::En => format!(
+                        "✓ {} tunnel '{}' but failed to restart frpc: {}",
+                        action_word_en, name, e
+                    ),
+                    Lang::Zh => format!(
+                        "✓ {}隧道 '{}'，但 frpc 重启失败：{}",
+                        action_word_zh, name, e
+                    ),
                 };
+            }
+        }
+        self.refresh_launcher_state();
+    }
+
+    // ---------- v0.15: frpc subprocess lifecycle ----------
+
+    fn frpc_session_name(&self) -> String {
+        sys::frpc_tmux_session_name(&self.server_dir)
+    }
+
+    /// Start frpc inside a detached tmux session. No-op if already running.
+    /// Returns Err with a translated reason if any prerequisite is missing
+    /// (binary, token, tmux).
+    fn start_frpc(&mut self) -> Result<()> {
+        if sys::frpc_tmux_alive(&self.server_dir) {
+            return Ok(());
+        }
+        let Some(binary) = self.frpc_binary.clone() else {
+            anyhow::bail!(self.frpc_missing_message());
+        };
+        let Some(token) = self.natfrp_token.clone() else {
+            anyhow::bail!(match self.lang {
+                Lang::En => "no SakuraFrp token configured (press t on tab 8)",
+                Lang::Zh => "未配置 SakuraFrp token（在 SakuraFrp tab 按 t）",
+            });
+        };
+        if self.frpc_enabled_ids.is_empty() {
+            anyhow::bail!(match self.lang {
+                Lang::En => "no tunnels enabled (press e on a tunnel row first)",
+                Lang::Zh => "没有启用任何隧道（先在隧道列表里按 e 启用）",
+            });
+        }
+        let session = self.frpc_session_name();
+        let ids_joined: Vec<String> =
+            self.frpc_enabled_ids.iter().map(u64::to_string).collect();
+        // frpc -f "<token>:<id1>,<id2>" -n     (no version-check on startup;
+        // this is the user's machine, frpc updates are out-of-band)
+        let fetch_arg = format!("{}:{}", token, ids_joined.join(","));
+        let frpc_cmd = format!(
+            "{} -f {} -n",
+            sys::shell_quote_sh(&binary.display().to_string()),
+            sys::shell_quote_sh(&fetch_arg),
+        );
+        let status = std::process::Command::new("tmux")
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session,
+                "-c",
+                &self.server_dir.display().to_string(),
+                &frpc_cmd,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| "spawn tmux for frpc")?;
+        if !status.success() {
+            anyhow::bail!("tmux new-session failed for frpc");
+        }
+        // Give the proc table a moment so the next refresh sees the pid.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        self.frpc_pid = data::detect_frpc_pid(self.frpc_pid);
+        Ok(())
+    }
+
+    /// Stop frpc by killing its tmux session. SIGINT → frpc exits cleanly.
+    fn stop_frpc(&mut self) -> Result<()> {
+        let session = self.frpc_session_name();
+        if !sys::tmux_session_alive(&session) {
+            return Ok(());
+        }
+        let status = std::process::Command::new("tmux")
+            .args(["kill-session", "-t", &session])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| "kill tmux session for frpc")?;
+        if !status.success() {
+            anyhow::bail!("tmux kill-session failed");
+        }
+        // Poll briefly for pid to vanish — frpc handles SIGINT in <100 ms.
+        for _ in 0..30 {
+            if data::detect_frpc_pid(None).is_none() {
+                self.frpc_pid = None;
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        // Best-effort: even if we still see something, return Ok — the
+        // session is dead, sysinfo will catch up.
+        self.frpc_pid = None;
+        Ok(())
+    }
+
+    /// Stop + start. Used after toggling an enabled tunnel.
+    fn restart_frpc(&mut self) -> Result<()> {
+        self.stop_frpc().ok();
+        self.start_frpc()
+    }
+
+    /// Persist server-dir / lang / sakurafrp_address / frpc_enabled_ids.
+    fn persist_state(&self) -> Result<()> {
+        let mut state = read_persisted_state();
+        state.server_dir = Some(self.server_dir.clone());
+        state.lang = Some(self.lang.code().to_string());
+        state.sakurafrp_address = self.sakurafrp_address.clone();
+        // Keep container name field for backward-compat read; don't rewrite.
+        state.frpc_enabled_ids = self.frpc_enabled_ids.clone();
+        write_persisted_state(&state)?;
+        Ok(())
+    }
+
+    /// Resolve "the user needs to fetch a frpc binary" UX. Returns a status
+    /// string; populates the clipboard with the official URL when possible.
+    fn frpc_missing_message(&mut self) -> String {
+        // Make sure we have a manifest cached. One-shot fetch — if it fails
+        // we fall back to a generic message.
+        if self.clients_manifest.is_none() {
+            if let Ok(m) = natfrp::fetch_clients_manifest() {
+                self.clients_manifest = Some(m);
+            }
+        }
+        let target = data::host_target_for_manifest();
+        let install_dir = sys::config_dir();
+        let install_path = install_dir.join("frpc");
+
+        let url_opt = self.clients_manifest.as_ref().and_then(|m| {
+            target.and_then(|(os, arch)| {
+                m.frpc_archs
+                    .get(&format!("{}_{}", os, arch))
+                    .map(|a| a.url.clone())
+            })
+        });
+
+        if let Some(url) = url_opt.as_deref() {
+            // Best-effort copy to clipboard. Failure here is silent — the
+            // URL is still in the status message.
+            let _ = std::process::Command::new("wl-copy")
+                .arg(url)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            match self.lang {
+                Lang::En => format!(
+                    "✗ frpc not found. Download {} → save to {} (chmod +x). URL copied to clipboard.",
+                    url,
+                    install_path.display()
+                ),
+                Lang::Zh => format!(
+                    "✗ 没找到 frpc。下载 {} → 保存到 {}（chmod +x）。URL 已复制到剪贴板。",
+                    url,
+                    install_path.display()
+                ),
+            }
+        } else {
+            match self.lang {
+                Lang::En => format!(
+                    "✗ frpc not found. See https://www.natfrp.com/tunnel/launcher → save to {} (chmod +x).",
+                    install_path.display()
+                ),
+                Lang::Zh => format!(
+                    "✗ 没找到 frpc。参考 https://www.natfrp.com/tunnel/launcher → 保存到 {}（chmod +x）。",
+                    install_path.display()
+                ),
             }
         }
     }
@@ -702,20 +886,18 @@ impl App {
         };
     }
 
-    /// True when launcher container is up but the user has at least one tunnel
-    /// the API knows about — the (rare) "everything is configured but nothing
-    /// is moving" state we don't need to nag about. False otherwise → show the
-    /// `sf_launcher_hint` so the user knows where to go next. Treats Unknown
-    /// as "no docker / no opinion" → no hint, since the user might be on a
-    /// host where docker isn't the launcher transport.
+    /// v0.15 — show the "press S to start frpc" hint when at least one
+    /// tunnel is configured to be enabled but frpc itself isn't running.
+    /// Stays quiet when there are no tunnels (user hasn't done create-tunnel
+    /// yet) or when frpc is up.
     fn launcher_hint_applicable(&self) -> bool {
         if self.natfrp_tunnels.is_empty() {
             return false;
         }
-        matches!(
-            self.sakurafrp_docker.state,
-            data::DockerState::Stopped | data::DockerState::Missing
-        )
+        if self.frpc_pid.is_some() {
+            return false;
+        }
+        !self.frpc_enabled_ids.is_empty()
     }
 
     fn set_natfrp_token(&mut self, token: &str) -> Result<()> {
@@ -1602,70 +1784,6 @@ impl App {
         Ok(())
     }
 
-    fn set_sakurafrp_container(&mut self, value: &str) -> Result<()> {
-        let trimmed = value.trim();
-        let mut state = read_persisted_state();
-        if trimmed.is_empty() {
-            // Empty input = reset to default rather than clear (we always
-            // need *something* to probe; default is the canonical install).
-            self.sakurafrp_container = DEFAULT_SAKURAFRP_CONTAINER.to_string();
-            state.sakurafrp_container = None;
-            self.status = match self.lang {
-                Lang::En => format!("✓ Reset SakuraFrp container to {}.", DEFAULT_SAKURAFRP_CONTAINER),
-                Lang::Zh => format!("✓ SakuraFrp 容器名重置为 {}。", DEFAULT_SAKURAFRP_CONTAINER),
-            };
-        } else {
-            self.sakurafrp_container = trimmed.to_string();
-            state.sakurafrp_container = Some(trimmed.to_string());
-            self.status = match self.lang {
-                Lang::En => format!("✓ SakuraFrp container set: {}", trimmed),
-                Lang::Zh => format!("✓ SakuraFrp 容器名已保存：{}", trimmed),
-            };
-        }
-        let _ = write_persisted_state(&state);
-        // Re-probe immediately so the join-bar marker updates.
-        self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
-        Ok(())
-    }
-
-    fn run_frp_lifecycle(&mut self, verb: &str) {
-        let container = self.sakurafrp_container.clone();
-        match docker_lifecycle(verb, &container) {
-            Ok(_) => {
-                self.status = match self.lang {
-                    Lang::En => format!("✓ docker {} {}", verb, container),
-                    Lang::Zh => format!("✓ docker {} {} 完成", verb, container),
-                };
-            }
-            Err(e) => {
-                self.status = match self.lang {
-                    Lang::En => format!("✗ docker {} failed: {}", verb, e),
-                    Lang::Zh => format!("✗ docker {} 失败：{}", verb, e),
-                };
-            }
-        }
-        // Re-probe so the marker reflects the new state.
-        self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
-    }
-
-    fn show_frp_logs_command(&mut self) {
-        let cmd = format!("docker logs -f --tail 50 {}", self.sakurafrp_container);
-        let copied = std::process::Command::new("wl-copy")
-            .arg(&cmd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|st| st.success())
-            .unwrap_or(false);
-        self.status = match (self.lang, copied) {
-            (Lang::En, true) => format!("ℹ Copied to clipboard: {}", cmd),
-            (Lang::En, false) => format!("ℹ {} (wl-copy unavailable)", cmd),
-            (Lang::Zh, true) => format!("ℹ 已复制到剪贴板：{}", cmd),
-            (Lang::Zh, false) => format!("ℹ {}（wl-copy 不可用）", cmd),
-        };
-    }
-
     fn show_systemd_status(&mut self) {
         let unit_dir = config_dir().parent().unwrap_or(Path::new(".")).join("systemd").join("user");
         self.status = match self.lang {
@@ -2003,7 +2121,6 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         }
                         PromptAction::PreGenChunkRadius => app.pregen_chunks(&value)?,
                         PromptAction::SetSakuraFrpAddress => app.set_sakurafrp_address(&value)?,
-                        PromptAction::SetSakuraFrpContainer => app.set_sakurafrp_container(&value)?,
                         PromptAction::SetNatfrpToken => app.set_natfrp_token(&value)?,
                         PromptAction::CreateTunnelName => {
                             app.handle_create_tunnel_name(&value)?
@@ -2310,29 +2427,76 @@ fn handle_server_action(app: &mut App, a: ServerAction) -> Result<()> {
             });
             Ok(())
         }
-        ServerAction::SetSakuraFrpContainer => {
-            app.prompt = Some(InputPrompt {
-                title: s.frp_prompt_container_title.into(),
-                label: s.frp_prompt_container_label.into(),
-                buffer: app.sakurafrp_container.clone(),
-                action: PromptAction::SetSakuraFrpContainer,
-            });
+        ServerAction::FrpcStart => {
+            match app.start_frpc() {
+                Ok(()) => {
+                    app.status = match app.lang {
+                        Lang::En => "✓ frpc starting in tmux session.".into(),
+                        Lang::Zh => "✓ frpc 已在 tmux session 中启动。".into(),
+                    };
+                }
+                Err(e) => {
+                    app.status = match app.lang {
+                        Lang::En => format!("✗ Could not start frpc: {}", e),
+                        Lang::Zh => format!("✗ frpc 启动失败：{}", e),
+                    };
+                }
+            }
             Ok(())
         }
-        ServerAction::SakuraFrpStart => {
-            app.run_frp_lifecycle("start");
+        ServerAction::FrpcStop => {
+            match app.stop_frpc() {
+                Ok(()) => {
+                    app.status = match app.lang {
+                        Lang::En => "✓ frpc stopped.".into(),
+                        Lang::Zh => "✓ frpc 已停止。".into(),
+                    };
+                }
+                Err(e) => {
+                    app.status = match app.lang {
+                        Lang::En => format!("✗ Stop failed: {}", e),
+                        Lang::Zh => format!("✗ 停止失败：{}", e),
+                    };
+                }
+            }
             Ok(())
         }
-        ServerAction::SakuraFrpStop => {
-            app.run_frp_lifecycle("stop");
+        ServerAction::FrpcRestart => {
+            match app.restart_frpc() {
+                Ok(()) => {
+                    app.status = match app.lang {
+                        Lang::En => "✓ frpc restarted.".into(),
+                        Lang::Zh => "✓ frpc 已重启。".into(),
+                    };
+                }
+                Err(e) => {
+                    app.status = match app.lang {
+                        Lang::En => format!("✗ Restart failed: {}", e),
+                        Lang::Zh => format!("✗ 重启失败：{}", e),
+                    };
+                }
+            }
             Ok(())
         }
-        ServerAction::SakuraFrpRestart => {
-            app.run_frp_lifecycle("restart");
-            Ok(())
-        }
-        ServerAction::SakuraFrpShowLogs => {
-            app.show_frp_logs_command();
+        ServerAction::FrpcShowLogs => {
+            // tmux attach to the frpc session — same UX as the existing
+            // ShowAttachCommand for the MC server.
+            let session = sys::frpc_tmux_session_name(&app.server_dir);
+            let cmd = format!("tmux attach -t {}", session);
+            let copied = std::process::Command::new("wl-copy")
+                .arg(&cmd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            app.status = match (app.lang, copied) {
+                (Lang::En, true) => format!("✓ Copied: {}", cmd),
+                (Lang::En, false) => format!("ℹ Run: {}", cmd),
+                (Lang::Zh, true) => format!("✓ 已复制：{}", cmd),
+                (Lang::Zh, false) => format!("ℹ 运行：{}", cmd),
+            };
             Ok(())
         }
     }
@@ -2735,6 +2899,36 @@ mod tests {
         assert_eq!(server_dir, Some(PathBuf::from("/srv/mc")));
         assert_eq!(lang.as_deref(), Some("zh"));
         assert_eq!(sakurafrp_address.as_deref(), Some("cn-sh-bgp.frp.one:23456"));
+    }
+
+    /// v0.15 — frpc_enabled_ids serializes as comma-separated u64 in state.toml.
+    /// We can't safely mutate XDG_CONFIG_HOME from a parallel test (races with
+    /// the natfrp_token test), so this just exercises the same parser shape
+    /// the existing `persisted_state_roundtrip` test uses — string-only.
+    #[test]
+    fn frpc_enabled_ids_parser_drops_malformed_entries() {
+        // Mirror the inline parser shape used by sys::read_persisted_state.
+        let raw = "frpc_enabled_ids = \"27014725,not-a-number,27014726, ,9\"\n";
+        let mut ids: Vec<u64> = Vec::new();
+        for line in raw.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(eq) = line.find('=') {
+                let k = line[..eq].trim();
+                let v = line[eq + 1..].trim().trim_matches('"');
+                if k == "frpc_enabled_ids" {
+                    ids = v
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .filter_map(|s| s.parse().ok())
+                        .collect();
+                }
+            }
+        }
+        assert_eq!(ids, vec![27014725, 27014726, 9]);
     }
 
     #[test]

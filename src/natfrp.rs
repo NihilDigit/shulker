@@ -189,6 +189,75 @@ pub fn classify_ureq_error(e: ureq::Error) -> NatfrpError {
     }
 }
 
+// ---------- v0.15: clients manifest (frpc binary download URLs) ----------
+//
+// `https://api.natfrp.com/v4/system/clients` returns a manifest of every
+// official client binary the SakuraFrp team ships, keyed by platform → arch.
+// We don't redistribute — we just point users at the right URL + hash for
+// their host. Endpoint requires no auth.
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientArch {
+    pub url: String,
+    pub hash: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ClientsManifest {
+    pub frpc_version: String,
+    /// Map of `<os>_<arch>` (matches `data::host_target_for_manifest` output)
+    /// to the download metadata for the frpc binary.
+    pub frpc_archs: HashMap<String, ClientArch>,
+}
+
+/// Hit `/v4/system/clients` (no auth) and parse out the frpc download URLs.
+/// Cheap call — no auth header needed; we still go through `Client` since it
+/// already has the timeout configured.
+pub fn fetch_clients_manifest() -> ApiResult<ClientsManifest> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(8))
+        .build();
+    let url = format!("{}/system/clients", API_BASE);
+    let resp = agent.get(&url).call().map_err(classify_ureq_error)?;
+    let body = resp
+        .into_string()
+        .map_err(|e| NatfrpError::Network(e.to_string()))?;
+    parse_clients_manifest(&body)
+}
+
+pub fn parse_clients_manifest(body: &str) -> ApiResult<ClientsManifest> {
+    let v: serde_json::Value = serde_json::from_str(body)
+        .map_err(|e| NatfrpError::Parse(format!("/system/clients: {}", e)))?;
+    let frpc = v
+        .get("frpc")
+        .ok_or_else(|| NatfrpError::Parse("missing 'frpc' key".into()))?;
+    let mut out = ClientsManifest::default();
+    if let Some(s) = frpc.get("ver").and_then(|x| x.as_str()) {
+        out.frpc_version = s.to_string();
+    }
+    if let Some(archs) = frpc.get("archs").and_then(|x| x.as_object()) {
+        for (key, val) in archs {
+            let url = val
+                .get("url")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let hash = val
+                .get("hash")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !url.is_empty() {
+                out.frpc_archs.insert(
+                    key.clone(),
+                    ClientArch { url, hash },
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
 // ---------- v0.14.1: launcher single-tunnel lifecycle ----------
 //
 // Story so far (and why this file is shorter than v0.14 had it):
@@ -694,6 +763,53 @@ mod tests {
         let body = r#"{"218":{"name":"test","host":"h","description":"游戏专用","vip":3,"flag":44}}"#;
         let ns = parse_nodes(body).unwrap();
         assert_eq!(ns.get(&218).unwrap().vip, 3);
+    }
+
+    /// v0.15 — pull a small subset of the real `/v4/system/clients` payload
+    /// (the bits we care about) and confirm we extract the frpc version +
+    /// per-arch URL/hash. Schema captured against the live response on
+    /// 2026-05-01; if upstream renames `frpc.archs.<key>.url`, this catches it.
+    #[test]
+    fn parses_clients_manifest_minimal() {
+        let body = r#"{
+            "frpc": {
+                "ver": "0.51.0-sakura-12.3",
+                "archs": {
+                    "linux_amd64": {
+                        "title": "Linux 64",
+                        "url": "https://nya.globalslb.net/natfrp/client/frpc/0.51.0-sakura-12.3/frpc_linux_amd64",
+                        "hash": "8ba7dcde07b1181e4f011e011321c6f8"
+                    },
+                    "darwin_arm64": {
+                        "title": "macOS Apple Silicon",
+                        "url": "https://nya.globalslb.net/natfrp/client/frpc/0.51.0-sakura-12.3/frpc_darwin_arm64",
+                        "hash": "19b546b7bcfd709a94d583280fb3cc4d"
+                    },
+                    "docker_natfrp": {
+                        "title": "Docker",
+                        "url": "https://natfrp.com/registry/#!/taglist/frpc"
+                    }
+                }
+            }
+        }"#;
+        let m = parse_clients_manifest(body).unwrap();
+        assert_eq!(m.frpc_version, "0.51.0-sakura-12.3");
+        let linux = m.frpc_archs.get("linux_amd64").unwrap();
+        assert!(linux.url.ends_with("frpc_linux_amd64"));
+        assert_eq!(linux.hash, "8ba7dcde07b1181e4f011e011321c6f8");
+        // Docker entry has no hash; should still appear with empty hash.
+        let docker = m.frpc_archs.get("docker_natfrp").unwrap();
+        assert!(docker.hash.is_empty());
+    }
+
+    #[test]
+    fn parse_clients_manifest_rejects_missing_frpc_key() {
+        let body = r#"{"windows":{}}"#;
+        let err = parse_clients_manifest(body).unwrap_err();
+        match err {
+            NatfrpError::Parse(_) => {}
+            other => panic!("expected Parse, got {:?}", other),
+        }
     }
 
     /// v0.14.1 — RFC 4231 HMAC-SHA256 test vector, hex-encoded. Validates

@@ -15,7 +15,7 @@ Manages the boring parts of running a friend-group Minecraft server without leav
 - **5 YAML** — pick a Paper/Purpur YAML (`paper-global.yml`, `purpur.yml`, etc.), enter the file, navigate the flattened tree, edit leaf scalars in place.
 - **6 Backups** — list archives in `<server-dir>/backups`, `../backups`, `../mc-backups`, `../<name>-backups`. Newest-first with size + age columns.
 - **7 Server (运维)** — restart now, run `backup.sh`, schedule a daily restart / backup as a `systemd --user` timer, pre-generate chunks via `tmux send-keys` to the server console (`chunky` plugin), show the `tmux attach` command. The top of this tab also lists every IPv4 interface.
-- **8 SakuraFrp** — pull the user's account header + tunnel list directly from `api.natfrp.com/v4`. Enter on a row copies the public address; `t` opens the token prompt; `r` re-fetches.
+- **8 SakuraFrp** — pull the user's account header + tunnel list directly from `api.natfrp.com/v4`. Enter on a row copies the public address; `t` opens the token prompt; `r` re-fetches; `c`/`m`/`d` create/migrate/delete tunnels via the API; `e`/`x` enable/disable a tunnel through mc-tui's directly-managed `frpc` subprocess (v0.15 — replaces the docker launcher path).
 
 Plus an always-visible **join address bar** between the status row and the tab bar — click the chip to copy `<ip>:<port>` to the clipboard via `wl-copy`.
 
@@ -284,6 +284,17 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 - [x] `d` on SakuraFrp tab fires a confirm prompt that requires typing the tunnel name verbatim (not just "yes") — extra friction for ADHD users with `d`-press muscle memory from the Players tab.
 - [x] Non-game-friendly node selection appends a dim warning to status (long-idle TCP can drop after ~30s).
 - [x] `screenshot --picker create|migrate` for QA without firing destructive ops.
+
+### v0.15 — Direct frpc subprocess (shipped 2026-05-01)
+
+- [x] mc-tui now runs the SakuraFrp `frpc` binary itself via tmux instead of routing through the launcher container. Sub-second restart on tunnel toggle (vs ~10 s container restart).
+- [x] `find_frpc_binary` walks `$PATH` then `~/.config/mc-tui/frpc`. We never auto-download — keeps redistribution off the table. When missing, the SakuraFrp tab status surfaces the official download URL (resolved live from `api.natfrp.com/v4/system/clients`) and copies it to the clipboard.
+- [x] `frpc -f "TOKEN:id1,id2" -n` lets frpc pull tunnel config from SakuraFrp directly — no local `frpc.toml` to manage.
+- [x] `e` / `x` add/remove the selected tunnel id from `frpc_enabled_ids` (persisted in state.toml), then bounce the frpc tmux session. Restart is sub-second.
+- [x] Server tab actions: `Start frpc (tmux)` / `Stop frpc (tmux)` / `Restart frpc` / `Copy tmux attach command for frpc`. Replaces the v0.9 docker-launcher actions, which are gone.
+- [x] Join-bar `frp` marker reflects the frpc subprocess: ● running, ○ configured but not running, ✗ no binary, ? no config.
+
+> **Migration from v0.14.1**: stop the launcher container (`docker stop natfrp-service`) before pressing `e` to avoid two frpc instances fighting for the same tunnel. v0.15 keeps `state.toml::sakurafrp_container` parseable so existing state files don't error, but mc-tui no longer touches docker.
 
 ### v0.14 / v0.14.1 — SakuraFrp launcher single-tunnel lifecycle (shipped 2026-05-01)
 

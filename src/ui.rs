@@ -13,8 +13,8 @@ use ratatui::{
 };
 
 use crate::data::{
-    detect_interfaces, fmt_bytes, get_property, nic_kind_color, nic_kind_label, DockerState,
-    NicInfo, NicKind, YamlDisplay,
+    detect_interfaces, fmt_bytes, get_property, nic_kind_color, nic_kind_label, NicInfo, NicKind,
+    YamlDisplay,
 };
 use crate::i18n::{
     fmt_log_read_error, fmt_status_running, hint_for, property_metadata, property_zh,
@@ -837,11 +837,17 @@ fn draw_join_info(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
     // bracketed kind label also embeds a Docker state marker (●/○/✗/?) so the
     // user can see at a glance whether the launcher container is up.
     if let Some(addr) = app.effective_sakurafrp_address() {
-        let (state_marker, state_color) = match app.sakurafrp_docker.state {
-            DockerState::Running => ("●", Color::Green),
-            DockerState::Stopped => ("○", Color::Yellow),
-            DockerState::Missing => ("✗", Color::Red),
-            DockerState::Unknown => ("?", Color::DarkGray),
+        // v0.15 — marker reflects mc-tui's directly-managed frpc subprocess,
+        // not the docker launcher container. ● when up, ○ when configured
+        // but not running, ✗ when no binary, ? when no token / no tunnels.
+        let (state_marker, state_color) = if app.frpc_pid.is_some() {
+            ("●", Color::Green)
+        } else if app.frpc_binary.is_none() {
+            ("✗", Color::Red)
+        } else if !app.frpc_enabled_ids.is_empty() {
+            ("○", Color::Yellow)
+        } else {
+            ("?", Color::DarkGray)
         };
 
         let name_span = Span::styled(
