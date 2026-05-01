@@ -47,7 +47,12 @@ pub struct Strings {
     pub level_label: &'static str,
     pub dir_label: &'static str,
     pub status_stopped: &'static str,
-    // Tab names
+    // Tab names (v0.16: 5-tab layout — Overview, Players, Worlds, Settings,
+    // Network). Older names kept for backwards-compat with downstream code
+    // until Phase 10 cleanup.
+    pub tab_overview: &'static str,
+    pub tab_settings: &'static str,
+    pub tab_network: &'static str,
     pub tab_worlds: &'static str,
     pub tab_whitelist: &'static str,
     pub tab_ops: &'static str,
@@ -61,7 +66,10 @@ pub struct Strings {
     pub title_ops: &'static str,
     pub title_config: &'static str,
     pub title_logs_prefix: &'static str, // prefix; full title = `<prefix><path> `
-    // Hints
+    // Hints (v0.16: per-tab; legacy fields kept until Phase 10).
+    pub hint_overview: &'static str,
+    pub hint_settings: &'static str,
+    pub hint_network: &'static str,
     pub hint_worlds: &'static str,
     pub hint_whitelist: &'static str,
     pub hint_ops: &'static str,
@@ -252,6 +260,9 @@ pub const EN: Strings = Strings {
     level_label: "level: ",
     dir_label: "dir: ",
     status_stopped: "○ stopped",
+    tab_overview: "Overview",
+    tab_settings: "Settings",
+    tab_network: "Network",
     tab_worlds: "Worlds",
     tab_whitelist: "Whitelist",
     tab_ops: "Ops",
@@ -264,11 +275,14 @@ pub const EN: Strings = Strings {
     title_ops: " Operators (←/→ change level) ",
     title_config: " server.properties (Enter = edit) ",
     title_logs_prefix: " Logs — tail of ",
-    hint_worlds: "↑/↓ select   Enter switch   N new   S start   X stop   D dir   L lang   r refresh   q quit",
+    hint_overview: "L logs   B backup   R restart   S start   X stop   : commands   ? help",
+    hint_settings: "↑↓ Enter edit   r refresh   ? help",
+    hint_network: "Enter copy  e/x on/off  c/m/d create/migrate/delete  i setup  t token  A manual addr  n NICs  ? help",
+    hint_worlds: "↑↓ Enter switch   N new   r refresh   ? help",
     hint_whitelist: "↑/↓ select   a add   d remove   S start   X stop   D dir   L lang   r refresh   q quit",
     hint_ops: "↑/↓ select   a add   d remove   ←/→ level   S start   X stop   D dir   L lang   q quit",
-    hint_config: "↑/↓ select   Enter edit   S start   X stop   D dir   L lang   r refresh   q quit",
-    hint_logs: "f toggle server/frpc   S start   X stop   D dir   L lang   r refresh   Tab/1-8 tabs   q quit",
+    hint_config: "↑↓ Enter edit   r refresh   ? help",
+    hint_logs: "↑↓ scroll  PgUp/PgDn page  1/2/3/4 ALL/INFO/WARN/ERR  f switch source  Esc close",
     prompt_confirm_cancel: "Enter = confirm    Esc = cancel",
     prompt_label_player: "player name",
     prompt_label_world: "world name",
@@ -413,8 +427,8 @@ pub const EN: Strings = Strings {
     sf_tunnels_empty_option_browser_b: "        → type tcp / local 127.0.0.1:25565",
     sf_tunnels_empty_option_launcher: "  • Or: create one in the launcher GUI",
     sf_action_open_dashboard: "Open natfrp.com",
-    sf_mihomo_warning: "⚠ Sparkle/mihomo is running — friends may disconnect after ~30s. Run `pkill -f sparkle && docker restart natfrp-service` before they join.",
-    sf_launcher_hint: "ℹ Tunnels enabled but frpc isn't running — go to the Server tab → Start frpc.",
+    sf_mihomo_warning: "⚠ Detected a system proxy — friends may disconnect ~30s after joining. Turn the proxy off and restart the tunnel from the Network tab.",
+    sf_launcher_hint: "ℹ Tunnels are enabled but the connector isn't running — restart it from the Network tab.",
     sf_traffic_warning_high: "⚠ Traffic over 80% of plan",
     sf_traffic_warning_critical: "⚠ Traffic over 95% of plan — tunnels may stop forwarding",
     sf_action_create: "Create",
@@ -441,6 +455,9 @@ pub const ZH: Strings = Strings {
     level_label: "世界: ",
     dir_label: "目录: ",
     status_stopped: "○ 已停止",
+    tab_overview: "概览",
+    tab_settings: "设置",
+    tab_network: "网络",
     tab_worlds: "世界",
     tab_whitelist: "白名单",
     tab_ops: "管理员",
@@ -453,11 +470,14 @@ pub const ZH: Strings = Strings {
     title_ops: " 管理员 (←/→ 调整级别) ",
     title_config: " server.properties (Enter 编辑) ",
     title_logs_prefix: " 日志 — 末尾来自 ",
-    hint_worlds: "↑/↓ 选择   Enter 切换   N 新建   S 启动   X 停止   D 切换目录   L 语言   r 刷新   q 退出",
+    hint_overview: "L 日志   B 备份   R 重启   S 启动   X 停止   : 命令   ? 帮助",
+    hint_settings: "↑↓ Enter 编辑   r 刷新   ? 帮助",
+    hint_network: "Enter 复制  e/x 启停  c/m/d 创建/迁移/删除  i 一键配置  t token  A 手动地址  n NIC 列表  ? 帮助",
+    hint_worlds: "↑↓ Enter 切换   N 新建   r 刷新   ? 帮助",
     hint_whitelist: "↑/↓ 选择   a 添加   d 移除   S 启动   X 停止   D 切换目录   L 语言   r 刷新   q 退出",
     hint_ops: "↑/↓ 选择   a 添加   d 移除   ←/→ 级别   S 启动   X 停止   D 切换目录   L 语言   q 退出",
-    hint_config: "↑/↓ 选择   Enter 编辑   S 启动   X 停止   D 切换目录   L 语言   r 刷新   q 退出",
-    hint_logs: "f 切换 server/frpc   S 启动   X 停止   D 目录   L 语言   r 刷新   Tab/1-8 切换   q 退出",
+    hint_config: "↑↓ Enter 编辑   r 刷新   ? 帮助",
+    hint_logs: "↑↓ 滚屏  PgUp/PgDn 翻页  1/2/3/4 全部/信息/警告/错误  f 切日志源  Esc 关闭",
     prompt_confirm_cancel: "Enter 确认    Esc 取消",
     prompt_label_player: "玩家名",
     prompt_label_world: "世界名",
@@ -602,8 +622,8 @@ pub const ZH: Strings = Strings {
     sf_tunnels_empty_option_browser_b: "        → 类型 tcp / 本地 127.0.0.1:25565",
     sf_tunnels_empty_option_launcher: "  • 或：用 launcher GUI 建",
     sf_action_open_dashboard: "打开 natfrp.com",
-    sf_mihomo_warning: "⚠ Sparkle/mihomo 在跑 — 朋友可能 30 秒后掉线，玩之前先跑 `pkill -f sparkle && docker restart natfrp-service`。",
-    sf_launcher_hint: "ℹ 已配置启用隧道但 frpc 未运行 — 到「运维」tab 启动 frpc。",
+    sf_mihomo_warning: "⚠ 检测到系统代理 — 朋友进来约 30 秒后可能掉线。开玩前请关掉代理，并在「网络」tab 重启转发。",
+    sf_launcher_hint: "ℹ 隧道已启用但转发进程未运行 — 到「网络」tab 重启转发。",
     sf_traffic_warning_high: "⚠ 流量已用超过 80%",
     sf_traffic_warning_critical: "⚠ 流量已用超过 95% — 隧道可能停止转发",
     sf_action_create: "创建",
@@ -630,31 +650,28 @@ pub const ZH: Strings = Strings {
 pub fn tab_name(lang: Lang, id: TabId) -> &'static str {
     let s = lang.s();
     match id {
-        TabId::Worlds => s.tab_worlds,
+        TabId::Overview => s.tab_overview,
         TabId::Players => s.tab_players,
-        TabId::Config => s.tab_config,
-        TabId::Logs => s.tab_logs,
-        TabId::Yaml => "YAML",
-        TabId::Backups => s.tab_backups,
-        TabId::Server => s.tab_ops_panel,
-        TabId::SakuraFrp => s.tab_sakurafrp,
+        TabId::Worlds => s.tab_worlds,
+        TabId::Settings => s.tab_settings,
+        TabId::Network => s.tab_network,
     }
 }
 
 pub fn hint_for(lang: Lang, id: TabId, yaml_view: &YamlView) -> &'static str {
     let s = lang.s();
     match id {
-        TabId::Worlds => s.hint_worlds,
+        TabId::Overview => s.hint_overview,
         TabId::Players => s.hint_players,
-        TabId::Config => s.hint_config,
-        TabId::Logs => s.hint_logs,
-        TabId::Yaml => match yaml_view {
-            YamlView::Files => s.hint_yaml_files,
+        TabId::Worlds => s.hint_worlds,
+        // Settings absorbs Config + YAML. Hint shifts based on the active
+        // sub-view: file picker / property editor / yaml row editor.
+        TabId::Settings => match yaml_view {
+            YamlView::Files => s.hint_settings,
+            YamlView::Properties => s.hint_config,
             YamlView::Editing { .. } => s.hint_yaml_edit,
         },
-        TabId::Backups => s.hint_backups,
-        TabId::Server => s.hint_server,
-        TabId::SakuraFrp => s.hint_sakurafrp,
+        TabId::Network => s.hint_network,
     }
 }
 
@@ -668,11 +685,6 @@ pub fn server_action_label(lang: Lang, a: ServerAction) -> &'static str {
         ServerAction::PreGenChunks => s.server_action_pregen,
         ServerAction::OpenSystemdStatus => s.server_action_systemd_status,
         ServerAction::ShowAttachCommand => s.server_action_attach,
-        ServerAction::SetSakuraFrpAddress => s.server_action_set_frp_address,
-        ServerAction::FrpcStart => s.server_action_frpc_start,
-        ServerAction::FrpcStop => s.server_action_frpc_stop,
-        ServerAction::FrpcRestart => s.server_action_frpc_restart,
-        ServerAction::FrpcShowLogs => s.server_action_frpc_show_logs,
     }
 }
 
@@ -839,11 +851,11 @@ pub fn fmt_sf_err_http(lang: Lang, code: u16) -> String {
 pub fn fmt_sf_err_network(lang: Lang, detail: &str) -> String {
     match lang {
         Lang::En => format!(
-            "✗ Cannot reach api.natfrp.com ({}). If Sparkle/mihomo is running, try `pkill -f sparkle`.",
+            "✗ Cannot reach api.natfrp.com ({}). If you have a system proxy on, turn it off and retry.",
             detail
         ),
         Lang::Zh => format!(
-            "✗ 连不上 api.natfrp.com ({})。若 Sparkle/mihomo 在跑，试试 `pkill -f sparkle`。",
+            "✗ 连不上 api.natfrp.com ({})。如果系统代理开着，关掉再试一次。",
             detail
         ),
     }

@@ -821,8 +821,8 @@ pub fn nic_kind_color(k: NicKind) -> Color {
         NicKind::Lan => Color::Green,
         NicKind::Public => Color::Yellow,
         NicKind::Tun => Color::Cyan,
-        NicKind::Docker => Color::DarkGray,
-        NicKind::Loopback => Color::DarkGray,
+        NicKind::Docker => Color::Gray,
+        NicKind::Loopback => Color::Gray,
     }
 }
 

@@ -82,23 +82,34 @@ mc-tui screenshot --tab worlds --lang zh --width 130 --height 32
 | Key | Action |
 |---|---|
 | `1` … `8` | Jump to tab |
+| `1`…`5` | Jump to tab (Overview / Players / Worlds / Settings / Network) |
 | `Tab` / `Shift+Tab` | Cycle tabs |
-| `↑` / `↓` | Move selection |
-| `Enter` | Switch world / Toggle whitelist (Players) / Edit config or YAML / Run server action / Copy SakuraFrp address |
-| `Esc` | Cancel prompt; in YAML edit view, return to file picker |
+| `↑` / `↓` | Move selection (or scroll the Logs overlay) |
+| `PgUp` / `PgDn` / `Home` / `End` | Page / boundary scroll inside the Logs overlay |
+| `Enter` | Switch world / Toggle whitelist (Players) / Edit setting / Copy tunnel address (Network) |
+| `Esc` | Close any overlay; back to file picker from Settings sub-views |
 | `a` | Add player (Players tab — opens whitelist-add prompt) |
-| `d` | Purge player from whitelist + ops (Players tab) |
-| `o` | Toggle op for selected player (Players tab) |
+| `d` | Purge player from whitelist + ops (Players); delete tunnel (Network) |
+| `o` | Toggle op for selected player (Players); open natfrp.com (Network) |
 | `←` / `→` | Cycle op level for selected player (Players tab — wraps 1↔4) |
 | `w` | Toggle `white-list` setting (Players tab) |
-| `t` | Set SakuraFrp API token (SakuraFrp tab) |
+| `e` / `x` | Enable / disable selected tunnel (Network); also recovers the forwarder if it crashed |
+| `c` / `m` | Create / migrate tunnel (Network) |
+| `i` | One-key SakuraFrp setup wizard (Network) |
+| `t` | Set SakuraFrp API token (Network) |
+| `A` | Manual SakuraFrp address override (Network) |
+| `n` | Toggle the (collapsed by default) NIC list (Network) |
+| `Y` | Copy share-text to clipboard (any tab) |
 | `N` | New world (Worlds tab) |
-| `S` | Start server (spawns `start.sh` in a detached tmux session) |
-| `X` | Stop server (sends `stop` to the tmux console) |
+| `S` / `X` / `R` | Start / stop / restart the server (any tab) |
+| `B` | Run `backup.sh` now (any tab) |
+| `L` | Open fullscreen log overlay (any tab) |
+| `?` | Open help overlay (legend + every shortcut) |
+| `:` | Open command palette (advanced ops: schedule, pre-gen chunks, tmux attach, systemd paths) |
 | `D` | Switch `--server-dir` at runtime |
-| `L` | Toggle 中 / EN |
-| `r` | Refresh from disk (and from SakuraFrp API on tab 8) |
-| `q` / `Esc` | Quit |
+| `T` | Toggle 中 / EN (was `L` pre-v0.16; `L` is now logs) |
+| `r` | Refresh from disk (and from SakuraFrp API on the Network tab) |
+| `q` | Quit |
 | Mouse | Click tab bar, list rows, or the join chip (chip → wl-copy) |
 
 When a prompt is open: type the value, `Enter` to confirm, `Esc` to cancel.
@@ -218,7 +229,7 @@ Tracked here instead of GitHub issues for now. Mark with date when shipped; keep
 
 ### v0.3 — i18n (shipped 2026-05-01)
 
-- [x] `Lang::{En, Zh}` enum, `L` toggles, persisted across runs.
+- [x] `Lang::{En, Zh}` enum, `T` toggles (was `L` until v0.16, when `L` was reassigned to the logs overlay), persisted across runs.
 - [x] All UI strings, hint bar, prompt labels, status messages route through `Strings` + EN/ZH consts.
 - [x] Common `server.properties` keys get a Chinese annotation in the Config tab; raw key still visible.
 

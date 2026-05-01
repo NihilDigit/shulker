@@ -17,7 +17,7 @@ use std::{
     fs,
     io,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -46,34 +46,38 @@ use serde::{Deserialize, Serialize};
 
 // ---------- App state ----------
 
+/// v0.16 — restructured from 8 verb-categories to 5 verbs. See CLAUDE.md
+/// roadmap. Old tabs (Logs/YAML/Backups/Server/Config/SakuraFrp) are absorbed:
+///   Logs       → fullscreen overlay (key `L`)
+///   YAML       → Settings file picker
+///   Backups    → Worlds detail panel
+///   Server     → command palette (key `:`) + frpc lifecycle on Network
+///   Config     → renamed Settings
+///   SakuraFrp  → renamed Network
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabId {
-    Worlds,
-    /// v0.11 — replaces the separate `Whitelist` and `Ops` tabs. Single roster
-    /// view: every name surfaces once, with toggleable whitelist + op flags.
+    Overview,
     Players,
-    Config,
-    Logs,
-    Yaml,
-    Backups,
-    Server,
-    SakuraFrp,
+    Worlds,
+    Settings,
+    Network,
 }
 
 const TABS: &[(TabId, &str)] = &[
-    (TabId::Worlds, "Worlds"),
+    (TabId::Overview, "Overview"),
     (TabId::Players, "Players"),
-    (TabId::Config, "Config"),
-    (TabId::Logs, "Logs"),
-    (TabId::Yaml, "YAML"),
-    (TabId::Backups, "Backups"),
-    (TabId::Server, "Server"),
-    (TabId::SakuraFrp, "SakuraFrp"),
+    (TabId::Worlds, "Worlds"),
+    (TabId::Settings, "Settings"),
+    (TabId::Network, "Network"),
 ];
 
-/// Server-tab actions (v0.6). Stable order — index used in events / tests.
+/// Command-palette actions (v0.16, formerly Server-tab actions). The original
+/// 12 entries were trimmed: frpc lifecycle (start/stop/restart/show-logs) is
+/// now implicit via Network-tab `e`/`x` (toggling a tunnel restarts frpc),
+/// and the manual SakuraFrp address override moved to Network-tab `A`. The
+/// remaining 7 surface in the `:` command palette overlay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServerAction {
+pub enum ServerAction {
     RestartNow,
     BackupNow,
     ScheduleDailyRestart,
@@ -81,16 +85,59 @@ enum ServerAction {
     PreGenChunks,
     OpenSystemdStatus,
     ShowAttachCommand,
-    // v0.8 — surface the SakuraFrp tunnel address in the join-bar.
-    SetSakuraFrpAddress,
-    // v0.15 — direct frpc lifecycle (replaces v0.9 docker container management).
-    FrpcStart,
-    FrpcStop,
-    FrpcRestart,
-    FrpcShowLogs,
 }
 
-const SERVER_ACTIONS: &[ServerAction] = &[
+/// v0.16 — fullscreen overlays that take precedence over tab content. Key
+/// events route to the overlay instead of the underlying tab while one is up.
+/// `LogsOverlay` (Phase 4) gets its own variant; the others fit a single
+/// `ListState` so they share `OverlayList`.
+#[derive(Debug, Default)]
+pub enum Overlay {
+    #[default]
+    None,
+    /// `?` — symbol legend + tab-grouped key list. Read-only; Esc closes.
+    Help,
+    /// `:` — command palette: advanced operations (schedule restart/backup,
+    /// pre-gen chunks, tmux attach, systemd unit paths) that used to live in
+    /// the now-deleted Server tab. ↑↓ select, Enter execute, Esc close.
+    Palette { state: ListState },
+    /// `L` — fullscreen scrollable log viewer with level filter. Phase 4
+    /// fleshes this out; for now an open variant just renders a placeholder.
+    Logs(LogsOverlay),
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LogsLevelFilter {
+    #[default]
+    All,
+    Info,
+    Warn,
+    Error,
+}
+
+/// State for the `L` fullscreen log overlay. `scroll_back` is "how many
+/// lines back from the tail to show" — 0 means autotail (always show the
+/// last screen), increments scroll up. Saturated to `total - height` by the
+/// renderer; pressing `End` resets to 0.
+#[derive(Debug, Clone, Default)]
+pub struct LogsOverlay {
+    pub source: LogsView,
+    pub filter: LogsLevelFilter,
+    /// Lines back from the tail. 0 = autotail. usize::MAX is the "scroll all
+    /// the way to top" sentinel — the renderer clamps it on each frame.
+    pub scroll_back: usize,
+}
+
+impl LogsOverlay {
+    pub fn is_autotail(&self) -> bool {
+        self.scroll_back == 0
+    }
+}
+
+/// Command-palette entries. Reuses `ServerAction` so the existing handler
+/// in main.rs (`handle_server_action`) keeps working — the palette is just a
+/// new entry-point for the same operations.
+const PALETTE_COMMANDS: &[ServerAction] = &[
     ServerAction::RestartNow,
     ServerAction::BackupNow,
     ServerAction::ShowAttachCommand,
@@ -98,12 +145,59 @@ const SERVER_ACTIONS: &[ServerAction] = &[
     ServerAction::ScheduleDailyBackup,
     ServerAction::PreGenChunks,
     ServerAction::OpenSystemdStatus,
-    ServerAction::SetSakuraFrpAddress,
-    ServerAction::FrpcStart,
-    ServerAction::FrpcStop,
-    ServerAction::FrpcRestart,
-    ServerAction::FrpcShowLogs,
 ];
+
+/// v0.16 — toast (transient status). Replaces the always-on status line that
+/// used to live in the footer. A toast appears in the bottom-right of the
+/// content area and auto-fades after a kind-dependent timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastKind {
+    /// Green check — 3s. "Did the thing" / "saved".
+    Ok,
+    /// Cyan info — 3s. Informational, non-actionable.
+    Info,
+    /// Yellow warn — 6s. Heads-up; user may want to act.
+    Warn,
+    /// Red x — 8s. Operation failed; user should read.
+    Err,
+}
+
+impl ToastKind {
+    pub fn duration(self) -> Duration {
+        match self {
+            ToastKind::Ok | ToastKind::Info => Duration::from_secs(3),
+            ToastKind::Warn => Duration::from_secs(6),
+            ToastKind::Err => Duration::from_secs(8),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub message: String,
+    pub kind: ToastKind,
+    pub expires_at: Instant,
+}
+
+/// Classify a status string by its leading glyph. Lets the bulk of legacy
+/// status sites push to the toast system without spelling a kind out at every
+/// callsite — they keep their existing prefix conventions and the kind is
+/// inferred. Anything that doesn't match a glyph defaults to Info.
+pub fn classify_status(msg: &str) -> ToastKind {
+    let trimmed = msg.trim_start();
+    if trimmed.starts_with('\u{2713}') {
+        // ✓
+        ToastKind::Ok
+    } else if trimmed.starts_with('\u{2717}') {
+        // ✗
+        ToastKind::Err
+    } else if trimmed.starts_with('\u{26A0}') {
+        // ⚠
+        ToastKind::Warn
+    } else {
+        ToastKind::Info
+    }
+}
 
 /// Default Docker container name for the SakuraFrp launcher image. The user
 /// can override it in state.toml or via the Server tab prompt; this is what
@@ -111,17 +205,27 @@ const SERVER_ACTIONS: &[ServerAction] = &[
 /// --name natfrp-service natfrp.com/launcher`.
 const DEFAULT_SAKURAFRP_CONTAINER: &str = "natfrp-service";
 
-/// YAML tab toggles between file picker and a flat row editor for one file.
+/// Settings tab view (v0.16 — formerly the YAML tab's `YamlView`, extended to
+/// also cover `server.properties` editing now that Settings absorbed the old
+/// Config tab). Three states:
+///   * Files — file picker (server.properties as virtual entry 0, then yaml
+///     files). User picks → transitions to Properties or Yaml.
+///   * Properties — the property editor (server.properties).
+///   * Yaml { file_idx } — the YAML row editor for `yaml_files[file_idx]`.
+/// Esc from Properties / Yaml returns to Files.
 #[derive(Debug, Clone)]
-enum YamlView {
+pub enum YamlView {
     Files,
+    Properties,
     Editing { file_idx: usize },
 }
 
-/// Logs tab can show either the MC server log (default) or the frpc tmux
-/// capture-pane output. Toggled via `f`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Logs view: MC server log (default) or frpc tmux capture-pane output.
+/// In v0.16 the Logs *tab* is gone; this drives the fullscreen Logs overlay
+/// (key `L`) and the Phase-5 Overview tail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LogsView {
+    #[default]
     Server,
     Frpc,
 }
@@ -321,6 +425,20 @@ struct App {
     pub clients_manifest: Option<natfrp::ClientsManifest>,
 
     pub status: String,
+    /// v0.16 — toast (transient status). UI renders in content-area corner;
+    /// auto-clears after kind-dependent timeout. Set via `set_status` (which
+    /// classifies by leading glyph) or `toast` for explicit kind. The legacy
+    /// `status` field stays around for the (rare) callsites that want a
+    /// non-fading message; Phase 2 cleanup migrated almost everything.
+    pub toast: Option<Toast>,
+    /// v0.16 — fullscreen overlay (help / command palette / logs). When
+    /// non-`None`, the tab content is still rendered underneath but key
+    /// events route to the overlay handler.
+    pub overlay: Overlay,
+    /// v0.16 — Network tab toggle: when true, the (folded by default) NIC
+    /// list expands at the bottom for the rare case the user wants to share a
+    /// non-primary interface (ZeroTier, secondary VPN, …). Press `n`.
+    pub network_show_nics: bool,
     pub prompt: Option<InputPrompt>,
 
     // Mouse hit-testing rects, populated each frame inside `ui()`.
@@ -349,7 +467,7 @@ impl App {
             whitelist_corrupt: false,
             ops_corrupt: false,
             pid: None,
-            tab: TabId::Worlds,
+            tab: TabId::Overview,
             worlds_state: ListState::default(),
             players: Vec::new(),
             players_state: ListState::default(),
@@ -387,10 +505,10 @@ impl App {
             frpc_pid: None,
             frpc_enabled_ids: read_persisted_state().frpc_enabled_ids,
             clients_manifest: None,
-            status: match lang {
-                Lang::En => String::from("Ready."),
-                Lang::Zh => String::from("就绪。"),
-            },
+            status: String::new(),
+            toast: None,
+            overlay: Overlay::None,
+            network_show_nics: false,
             prompt: None,
             tabs_rect: Rect::default(),
             list_rect: Rect::default(),
@@ -496,33 +614,35 @@ impl App {
 
     fn list_state_for(&mut self, tab: TabId) -> &mut ListState {
         match tab {
+            // Overview has no list to navigate (Phase 5 may add one); reuse
+            // worlds_state as a harmless dummy so move_selection is a no-op.
+            TabId::Overview => &mut self.worlds_state,
             TabId::Worlds => &mut self.worlds_state,
             TabId::Players => &mut self.players_state,
-            TabId::Config => &mut self.config_state,
-            TabId::Logs => &mut self.worlds_state,
-            TabId::Yaml => match self.yaml_view {
+            TabId::Settings => match self.yaml_view {
+                // File picker reuses yaml_files_state — selection survives
+                // entering / leaving a file.
                 YamlView::Files => &mut self.yaml_files_state,
+                YamlView::Properties => &mut self.config_state,
                 YamlView::Editing { .. } => &mut self.yaml_rows_state,
             },
-            TabId::Backups => &mut self.backups_state,
-            TabId::Server => &mut self.server_state,
-            TabId::SakuraFrp => &mut self.natfrp_state,
+            TabId::Network => &mut self.natfrp_state,
         }
     }
 
     fn list_len_for(&self, tab: TabId) -> usize {
         match tab {
+            TabId::Overview => 0,
             TabId::Worlds => self.worlds.len(),
             TabId::Players => self.players.len(),
-            TabId::Config => self.properties.len(),
-            TabId::Logs => 0,
-            TabId::Yaml => match self.yaml_view {
-                YamlView::Files => self.yaml_files.len(),
+            TabId::Settings => match self.yaml_view {
+                // +1 for the virtual `server.properties` entry that always
+                // sits at the top of the Settings file picker.
+                YamlView::Files => 1 + self.yaml_files.len(),
+                YamlView::Properties => self.properties.len(),
                 YamlView::Editing { .. } => self.yaml_rows.len(),
             },
-            TabId::Backups => self.backups.len(),
-            TabId::Server => SERVER_ACTIONS.len(),
-            TabId::SakuraFrp => self.natfrp_tunnels.len(),
+            TabId::Network => self.natfrp_tunnels.len(),
         }
     }
 
@@ -540,12 +660,40 @@ impl App {
 
     fn switch_tab(&mut self, tab: TabId) {
         self.tab = tab;
-        // Lazy-load SakuraFrp data the first time the user opens that tab.
-        // Subsequent refreshes are user-driven via 'r' to keep the network
-        // off the hot redraw path.
-        if tab == TabId::SakuraFrp && !self.natfrp_loaded && self.natfrp_token.is_some() {
+        // Lazy-load Network/SakuraFrp data the first time the user opens that
+        // tab. Subsequent refreshes are user-driven via 'r' to keep the
+        // network off the hot redraw path.
+        if tab == TabId::Network && !self.natfrp_loaded && self.natfrp_token.is_some() {
             self.refresh_natfrp();
         }
+    }
+
+    /// Set a transient toast classified by the leading glyph of the message.
+    /// Use this for the bulk-migration of the old `self.status = "..."` sites
+    /// — keep the existing prefix conventions (✓ / ✗ / ⚠) and the kind is
+    /// inferred. For non-prefixed messages, defaults to Info.
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        let m: String = msg.into();
+        let kind = classify_status(&m);
+        self.toast(m, kind);
+    }
+
+    /// Set a transient toast with explicit kind. Auto-expires per
+    /// `ToastKind::duration`.
+    pub fn toast(&mut self, msg: impl Into<String>, kind: ToastKind) {
+        self.toast = Some(Toast {
+            message: msg.into(),
+            kind,
+            expires_at: Instant::now() + kind.duration(),
+        });
+    }
+
+    /// Active toast (if any) — only returns Some while not yet expired. UI
+    /// calls this each frame; an expired toast is effectively cleared.
+    pub fn active_toast(&self) -> Option<&Toast> {
+        self.toast
+            .as_ref()
+            .filter(|t| t.expires_at > Instant::now())
     }
 
     /// Hits api.natfrp.com for /user/info + /tunnels + /nodes. Blocking — only
@@ -645,7 +793,19 @@ impl App {
         let id = t.id;
         let name = t.name.clone();
         let already = self.frpc_enabled_ids.contains(&id);
-        if enable && already {
+        let frpc_alive = self.frpc_pid.is_some();
+
+        // True no-op fast paths:
+        //   * disabling something that isn't enabled
+        //   * enabling something that *is* already enabled AND the daemon
+        //     is alive — nothing to do.
+        // The recovery case — `enable && already && !frpc_alive` — falls
+        // through so pressing `e` on an enabled tunnel after a daemon crash
+        // (or a fresh mc-tui session where state.toml carries enabled ids
+        // but no process is running yet) restarts the forwarder. Without
+        // this, the old behavior left the user no UI path to restart the
+        // forwarder short of `x` then `e`.
+        if enable && already && frpc_alive {
             self.status = match self.lang {
                 Lang::En => format!("→ Tunnel '{}' is already enabled.", name),
                 Lang::Zh => format!("→ 隧道 '{}' 已是启用状态。", name),
@@ -659,6 +819,9 @@ impl App {
             };
             return;
         }
+
+        // Mutate the persisted enabled-id list. push+dedup is idempotent so
+        // the recovery case doesn't double-add.
         if enable {
             self.frpc_enabled_ids.push(id);
             self.frpc_enabled_ids.sort_unstable();
@@ -673,33 +836,48 @@ impl App {
             };
             return;
         }
+
         // Bounce frpc so the new enabled-list takes effect. If frpc isn't
         // up yet, `restart_frpc` falls through to `start_frpc`.
-        let action_word_zh = if enable { "已启用" } else { "已停用" };
-        let action_word_en = if enable { "Enabled" } else { "Disabled" };
+        let recovery = enable && already && !frpc_alive;
         match self.restart_frpc() {
             Ok(()) => {
-                self.status = match self.lang {
-                    Lang::En => format!(
-                        "✓ {} tunnel '{}' (id {}). frpc restarted.",
-                        action_word_en, name, id
-                    ),
-                    Lang::Zh => format!(
-                        "✓ {}隧道 '{}' (id {})。frpc 已重启。",
-                        action_word_zh, name, id
-                    ),
+                self.status = if recovery {
+                    match self.lang {
+                        Lang::En => format!(
+                            "✓ Forwarder restarted (tunnel '{}' was already enabled).",
+                            name
+                        ),
+                        Lang::Zh => format!("✓ 转发已重启（隧道 '{}' 此前已启用）。", name),
+                    }
+                } else if enable {
+                    match self.lang {
+                        Lang::En => {
+                            format!("✓ Enabled tunnel '{}' (id {}). Forwarder restarted.", name, id)
+                        }
+                        Lang::Zh => {
+                            format!("✓ 已启用隧道 '{}' (id {})。转发已重启。", name, id)
+                        }
+                    }
+                } else {
+                    match self.lang {
+                        Lang::En => format!(
+                            "✓ Disabled tunnel '{}' (id {}). Forwarder restarted.",
+                            name, id
+                        ),
+                        Lang::Zh => {
+                            format!("✓ 已停用隧道 '{}' (id {})。转发已重启。", name, id)
+                        }
+                    }
                 };
             }
             Err(e) => {
                 self.status = match self.lang {
                     Lang::En => format!(
-                        "✓ {} tunnel '{}' but failed to restart frpc: {}",
-                        action_word_en, name, e
+                        "✗ Tunnel state updated but forwarder failed to (re)start: {}",
+                        e
                     ),
-                    Lang::Zh => format!(
-                        "✓ {}隧道 '{}'，但 frpc 重启失败：{}",
-                        action_word_zh, name, e
-                    ),
+                    Lang::Zh => format!("✗ 隧道状态已写入，但转发启动失败：{}", e),
                 };
             }
         }
@@ -1198,6 +1376,37 @@ impl App {
             }
         }
         self.sakurafrp_address.clone()
+    }
+
+    /// Y on Overview — copy the multi-line share text to clipboard via
+    /// wl-copy. Picks frp address if configured (preferred for non-LAN
+    /// friends); otherwise primary LAN interface.
+    pub fn copy_share_text(&mut self) {
+        let nics = detect_interfaces();
+        let port: u16 = get_property(&self.properties, "server-port")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(25565);
+        let primary = nics.iter().find(|n| {
+            !matches!(n.kind, NicKind::Loopback | NicKind::Docker | NicKind::Tun)
+        });
+        let frp_addr = self.effective_sakurafrp_address();
+        let lan = primary.map(|n| (n.ip.to_string(), port));
+        let text = crate::ui::build_share_text(self, lan, frp_addr.as_deref());
+        let copied = std::process::Command::new("wl-copy")
+            .arg(&text)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        let msg: String = match (self.lang, copied) {
+            (Lang::En, true) => "✓ Share text copied to clipboard.".into(),
+            (Lang::En, false) => "ℹ wl-copy unavailable — copy from the preview manually.".into(),
+            (Lang::Zh, true) => "✓ 分享文本已复制到剪贴板。".into(),
+            (Lang::Zh, false) => "ℹ wl-copy 不可用 — 请手动复制预览。".into(),
+        };
+        self.set_status(msg);
     }
 
     fn copy_selected_tunnel_address(&mut self) {
@@ -2453,64 +2662,80 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             continue;
         }
 
+        // v0.16 — overlay (help / palette / logs) intercepts input. Esc closes
+        // it. Help is read-only; palette has its own up/down/enter; logs
+        // overlay (Phase 4) handles its own scroll + filter keys.
+        if !matches!(app.overlay, Overlay::None) {
+            handle_overlay_key(app, key.code)?;
+            continue;
+        }
+
         match key.code {
             KeyCode::Char('q') => return Ok(()),
             KeyCode::Esc => {
-                // In YAML editing view, Esc returns to file picker instead of quitting.
-                if app.tab == TabId::Yaml {
-                    if let YamlView::Editing { .. } = app.yaml_view {
-                        app.yaml_close();
-                        continue;
+                // Settings → Properties / YAML editing: Esc returns to file
+                // picker instead of quitting.
+                if app.tab == TabId::Settings {
+                    match app.yaml_view {
+                        YamlView::Properties | YamlView::Editing { .. } => {
+                            app.yaml_close();
+                            continue;
+                        }
+                        YamlView::Files => {}
                     }
                 }
                 return Ok(());
             }
-            KeyCode::Char('1') => app.switch_tab(TabId::Worlds),
+            KeyCode::Char('1') => app.switch_tab(TabId::Overview),
             KeyCode::Char('2') => app.switch_tab(TabId::Players),
-            KeyCode::Char('3') => app.switch_tab(TabId::Config),
-            KeyCode::Char('4') => app.switch_tab(TabId::Logs),
-            KeyCode::Char('5') => app.switch_tab(TabId::Yaml),
-            KeyCode::Char('6') => app.switch_tab(TabId::Backups),
-            KeyCode::Char('7') => app.switch_tab(TabId::Server),
-            KeyCode::Char('8') => app.switch_tab(TabId::SakuraFrp),
+            KeyCode::Char('3') => app.switch_tab(TabId::Worlds),
+            KeyCode::Char('4') => app.switch_tab(TabId::Settings),
+            KeyCode::Char('5') => app.switch_tab(TabId::Network),
             KeyCode::Tab => app.cycle_tab(1),
             KeyCode::BackTab => app.cycle_tab(-1),
             KeyCode::Char('r') => {
                 app.refresh_all();
-                if app.tab == TabId::SakuraFrp {
+                if app.tab == TabId::Network {
                     app.refresh_natfrp();
                 } else {
-                    app.status = app.lang.s().refreshed.into();
+                    app.set_status(app.lang.s().refreshed);
                 }
             }
             KeyCode::Up => app.move_selection(-1),
             KeyCode::Down => app.move_selection(1),
             KeyCode::Enter => match app.tab {
                 TabId::Worlds => app.switch_world()?,
-                TabId::Config => {
-                    if let Some(idx) = app.config_state.selected() {
-                        if let Some((k, v)) = app.properties.get(idx).cloned() {
-                            let title = match app.lang {
-                                Lang::En => format!("Edit {}", k),
-                                Lang::Zh => format!("编辑 {}", k),
-                            };
-                            app.prompt = Some(InputPrompt {
-                                title,
-                                label: app.lang.s().prompt_label_value.into(),
-                                buffer: v,
-                                action: PromptAction::EditConfig(k),
-                            });
+                TabId::Settings => match app.yaml_view.clone() {
+                    YamlView::Files => {
+                        // File picker — entry 0 is server.properties (open
+                        // Properties view), entry 1+ are yaml files.
+                        if let Some(idx) = app.yaml_files_state.selected() {
+                            if idx == 0 {
+                                app.yaml_view = YamlView::Properties;
+                                if !app.properties.is_empty() {
+                                    app.config_state.select(Some(0));
+                                }
+                            } else {
+                                let yaml_idx = idx - 1;
+                                if let Err(e) = app.yaml_open(yaml_idx) {
+                                    app.set_status(format!("✗ {}", e));
+                                }
+                            }
                         }
                     }
-                }
-                TabId::Yaml => match app.yaml_view.clone() {
-                    YamlView::Files => {
-                        if let Some(idx) = app.yaml_files_state.selected() {
-                            if let Err(e) = app.yaml_open(idx) {
-                                app.status = match app.lang {
-                                    Lang::En => format!("✗ {}", e),
-                                    Lang::Zh => format!("✗ {}", e),
+                    YamlView::Properties => {
+                        if let Some(idx) = app.config_state.selected() {
+                            if let Some((k, v)) = app.properties.get(idx).cloned() {
+                                let title = match app.lang {
+                                    Lang::En => format!("Edit {}", k),
+                                    Lang::Zh => format!("编辑 {}", k),
                                 };
+                                app.prompt = Some(InputPrompt {
+                                    title,
+                                    label: app.lang.s().prompt_label_value.into(),
+                                    buffer: v,
+                                    action: PromptAction::EditConfig(k),
+                                });
                             }
                         }
                     }
@@ -2533,14 +2758,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         }
                     }
                 },
-                TabId::Server => {
-                    if let Some(idx) = app.server_state.selected() {
-                        if let Some(action) = SERVER_ACTIONS.get(idx).copied() {
-                            handle_server_action(app, action)?;
-                        }
-                    }
-                }
-                TabId::SakuraFrp => app.copy_selected_tunnel_address(),
+                TabId::Network => app.copy_selected_tunnel_address(),
                 TabId::Players => app.toggle_whitelist_for_selected()?,
                 _ => {}
             },
@@ -2557,33 +2775,27 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
             }
             KeyCode::Char('d') => match app.tab {
                 TabId::Players => app.remove_selected_player()?,
-                TabId::SakuraFrp => app.start_delete_tunnel(),
+                TabId::Network => app.start_delete_tunnel(),
                 _ => {}
             },
-            KeyCode::Char('c') if app.tab == TabId::SakuraFrp => {
+            KeyCode::Char('c') if app.tab == TabId::Network => {
                 app.start_create_tunnel();
             }
-            KeyCode::Char('m') if app.tab == TabId::SakuraFrp => {
+            KeyCode::Char('m') if app.tab == TabId::Network => {
                 app.start_migrate_tunnel();
             }
-            KeyCode::Char('e') if app.tab == TabId::SakuraFrp => {
+            KeyCode::Char('e') if app.tab == TabId::Network => {
                 app.enable_selected_tunnel();
             }
-            KeyCode::Char('x') if app.tab == TabId::SakuraFrp => {
+            KeyCode::Char('x') if app.tab == TabId::Network => {
                 app.disable_selected_tunnel();
             }
-            KeyCode::Char('i') if app.tab == TabId::SakuraFrp => {
+            KeyCode::Char('i') if app.tab == TabId::Network => {
                 app.start_setup_wizard();
-            }
-            KeyCode::Char('f') if app.tab == TabId::Logs => {
-                app.logs_view = match app.logs_view {
-                    LogsView::Server => LogsView::Frpc,
-                    LogsView::Frpc => LogsView::Server,
-                };
             }
             KeyCode::Char('o') => match app.tab {
                 TabId::Players => app.toggle_op_for_selected()?,
-                TabId::SakuraFrp => app.open_natfrp_dashboard(),
+                TabId::Network => app.open_natfrp_dashboard(),
                 _ => {}
             },
             KeyCode::Char('w') => {
@@ -2602,11 +2814,42 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     app.cycle_op_level_for_selected(1)?;
                 }
             }
-            // v0.2 new keys
+            // Global lifecycle keys (work on any tab).
             KeyCode::Char('S') => app.start_server()?,
             KeyCode::Char('X') => app.stop_server()?,
-            // v0.3 language toggle
-            KeyCode::Char('L') => app.toggle_lang(),
+            // v0.16 — uppercase R = restart now (top-level shortcut), B =
+            // backup now. They re-use the same code paths as the (now-deleted)
+            // Server tab actions, so behavior is identical to picking those
+            // entries from the command palette.
+            KeyCode::Char('R') => {
+                if let Err(e) = app.restart_now() {
+                    app.set_status(format!("✗ {}", e));
+                }
+            }
+            KeyCode::Char('B') => {
+                if let Err(e) = app.backup_now() {
+                    app.set_status(format!("✗ {}", e));
+                }
+            }
+            // Y = copy the share text (the multi-line "MC server / address /
+            // send me your username" message host pastes into chat).
+            KeyCode::Char('Y') => app.copy_share_text(),
+            // Overlays.
+            KeyCode::Char('?') => app.overlay = Overlay::Help,
+            KeyCode::Char(':') => {
+                let mut state = ListState::default();
+                state.select(Some(0));
+                app.overlay = Overlay::Palette { state };
+            }
+            KeyCode::Char('L') => {
+                app.overlay = Overlay::Logs(LogsOverlay {
+                    source: app.logs_view,
+                    filter: LogsLevelFilter::All,
+                    scroll_back: 0,
+                });
+            }
+            // Language toggle moved from L → T to free L for the logs overlay.
+            KeyCode::Char('T') => app.toggle_lang(),
             KeyCode::Char('N') => {
                 if app.tab == TabId::Worlds {
                     let s = app.lang.s();
@@ -2627,7 +2870,7 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     action: PromptAction::ChangeServerDir,
                 });
             }
-            KeyCode::Char('t') if app.tab == TabId::SakuraFrp => {
+            KeyCode::Char('t') if app.tab == TabId::Network => {
                 let s = app.lang.s();
                 app.prompt = Some(InputPrompt {
                     title: s.sf_prompt_token_title.into(),
@@ -2635,6 +2878,25 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     buffer: String::new(),
                     action: PromptAction::SetNatfrpToken,
                 });
+            }
+            // A — manual SakuraFrp address fallback (used when the API/launcher
+            // path isn't available but you have a tunnel address from the
+            // SakuraFrp dashboard). Replaces the old Server-tab action of the
+            // same name.
+            KeyCode::Char('A') if app.tab == TabId::Network => {
+                let s = app.lang.s();
+                app.prompt = Some(InputPrompt {
+                    title: s.frp_prompt_address_title.into(),
+                    label: s.frp_prompt_address_label.into(),
+                    buffer: app.sakurafrp_address.clone().unwrap_or_default(),
+                    action: PromptAction::SetSakuraFrpAddress,
+                });
+            }
+            // n — toggle the (collapsed by default) NIC list at the bottom of
+            // the Network tab. ZeroTier / secondary VPN / Docker bridges are
+            // there for the rare case the user wants a non-primary address.
+            KeyCode::Char('n') if app.tab == TabId::Network => {
+                app.network_show_nics = !app.network_show_nics;
             }
             _ => {}
         }
@@ -2695,88 +2957,106 @@ fn handle_server_action(app: &mut App, a: ServerAction) -> Result<()> {
             app.show_attach_command();
             Ok(())
         }
-        ServerAction::SetSakuraFrpAddress => {
-            app.prompt = Some(InputPrompt {
-                title: s.frp_prompt_address_title.into(),
-                label: s.frp_prompt_address_label.into(),
-                buffer: app.sakurafrp_address.clone().unwrap_or_default(),
-                action: PromptAction::SetSakuraFrpAddress,
-            });
-            Ok(())
+    }
+}
+
+/// v0.16 — overlay key dispatcher. Called when an overlay is up; routes Esc /
+/// nav / confirm / overlay-specific filters (logs source toggle, level
+/// filter). Returns Ok unconditionally — errors from action execution are
+/// surfaced through `set_status` rather than bubbled.
+fn handle_overlay_key(app: &mut App, code: KeyCode) -> Result<()> {
+    match code {
+        KeyCode::Esc => {
+            app.overlay = Overlay::None;
+            return Ok(());
         }
-        ServerAction::FrpcStart => {
-            match app.start_frpc() {
-                Ok(()) => {
-                    app.status = match app.lang {
-                        Lang::En => "✓ frpc starting in tmux session.".into(),
-                        Lang::Zh => "✓ frpc 已在 tmux session 中启动。".into(),
-                    };
-                }
-                Err(e) => {
-                    app.status = match app.lang {
-                        Lang::En => format!("✗ Could not start frpc: {}", e),
-                        Lang::Zh => format!("✗ frpc 启动失败：{}", e),
-                    };
-                }
-            }
-            Ok(())
-        }
-        ServerAction::FrpcStop => {
-            match app.stop_frpc() {
-                Ok(()) => {
-                    app.status = match app.lang {
-                        Lang::En => "✓ frpc stopped.".into(),
-                        Lang::Zh => "✓ frpc 已停止。".into(),
-                    };
-                }
-                Err(e) => {
-                    app.status = match app.lang {
-                        Lang::En => format!("✗ Stop failed: {}", e),
-                        Lang::Zh => format!("✗ 停止失败：{}", e),
-                    };
-                }
-            }
-            Ok(())
-        }
-        ServerAction::FrpcRestart => {
-            match app.restart_frpc() {
-                Ok(()) => {
-                    app.status = match app.lang {
-                        Lang::En => "✓ frpc restarted.".into(),
-                        Lang::Zh => "✓ frpc 已重启。".into(),
-                    };
-                }
-                Err(e) => {
-                    app.status = match app.lang {
-                        Lang::En => format!("✗ Restart failed: {}", e),
-                        Lang::Zh => format!("✗ 重启失败：{}", e),
-                    };
-                }
-            }
-            Ok(())
-        }
-        ServerAction::FrpcShowLogs => {
-            // tmux attach to the frpc session — same UX as the existing
-            // ShowAttachCommand for the MC server.
-            let session = sys::frpc_tmux_session_name(&app.server_dir);
-            let cmd = format!("tmux attach -t {}", session);
-            let copied = std::process::Command::new("wl-copy")
-                .arg(&cmd)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            app.status = match (app.lang, copied) {
-                (Lang::En, true) => format!("✓ Copied: {}", cmd),
-                (Lang::En, false) => format!("ℹ Run: {}", cmd),
-                (Lang::Zh, true) => format!("✓ 已复制：{}", cmd),
-                (Lang::Zh, false) => format!("ℹ 运行：{}", cmd),
+        KeyCode::Char('?') => {
+            // ? toggles Help open/closed for parity with vim-style help keys.
+            app.overlay = match std::mem::take(&mut app.overlay) {
+                Overlay::Help => Overlay::None,
+                _ => Overlay::Help,
             };
-            Ok(())
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    match &mut app.overlay {
+        Overlay::None | Overlay::Help => {
+            // Help has no extra interaction; everything else falls through.
+        }
+        Overlay::Palette { state } => {
+            let len = PALETTE_COMMANDS.len();
+            match code {
+                KeyCode::Up => {
+                    let cur = state.selected().unwrap_or(0) as isize;
+                    let new = (cur - 1).rem_euclid(len as isize) as usize;
+                    state.select(Some(new));
+                }
+                KeyCode::Down => {
+                    let cur = state.selected().unwrap_or(0) as isize;
+                    let new = (cur + 1).rem_euclid(len as isize) as usize;
+                    state.select(Some(new));
+                }
+                KeyCode::Enter => {
+                    if let Some(idx) = state.selected() {
+                        if let Some(cmd) = PALETTE_COMMANDS.get(idx).copied() {
+                            app.overlay = Overlay::None;
+                            if let Err(e) = handle_server_action(app, cmd) {
+                                app.set_status(format!("✗ {}", e));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Overlay::Logs(state) => {
+            // Conservative page size; the renderer clamps to total when the
+            // buffer is shorter than this.
+            const PAGE: usize = 24;
+
+            match code {
+                KeyCode::Char('f') => {
+                    state.source = match state.source {
+                        LogsView::Server => LogsView::Frpc,
+                        LogsView::Frpc => LogsView::Server,
+                    };
+                    // Source change → re-attach to tail so the user sees
+                    // current activity rather than the same offset into a
+                    // different log.
+                    state.scroll_back = 0;
+                }
+                KeyCode::Char('1') => {
+                    state.filter = LogsLevelFilter::All;
+                    state.scroll_back = 0;
+                }
+                KeyCode::Char('2') => {
+                    state.filter = LogsLevelFilter::Info;
+                    state.scroll_back = 0;
+                }
+                KeyCode::Char('3') => {
+                    state.filter = LogsLevelFilter::Warn;
+                    state.scroll_back = 0;
+                }
+                KeyCode::Char('4') => {
+                    state.filter = LogsLevelFilter::Error;
+                    state.scroll_back = 0;
+                }
+                KeyCode::Up => state.scroll_back = state.scroll_back.saturating_add(1),
+                KeyCode::Down => state.scroll_back = state.scroll_back.saturating_sub(1),
+                KeyCode::PageUp => state.scroll_back = state.scroll_back.saturating_add(PAGE),
+                KeyCode::PageDown => state.scroll_back = state.scroll_back.saturating_sub(PAGE),
+                // Home → top of buffer. usize::MAX is a sentinel; renderer
+                // clamps to actual `total - height` on the next frame.
+                KeyCode::Home => state.scroll_back = usize::MAX,
+                // End → re-attach to the tail.
+                KeyCode::End => state.scroll_back = 0,
+                _ => {}
+            }
         }
     }
+    Ok(())
 }
 
 fn handle_mouse(app: &mut App, me: MouseEvent) {
@@ -2808,23 +3088,30 @@ fn handle_mouse(app: &mut App, me: MouseEvent) {
     }
 
     if rect_contains(app.tabs_rect, col, row) {
-        // ratatui Tabs widget renders titles as " 1 Worlds " " │ " " 2 Whitelist " ...
-        // No border now (single-row tab bar), so titles start at tabs_rect.x.
+        // Tab title format must match `draw_tabs` exactly so click-zones line
+        // up. v0.16: Tabs are rendered with a single-space divider and the
+        // localized name (`tab_name(lang, id)`), and the title is " {idx} {name} ".
+        // Use unicode-width to count display columns — CJK names render
+        // 2 cols per char, so .chars().count() over-counts on EN, under-counts
+        // on ZH.
+        use unicode_width::UnicodeWidthStr;
         let inner_x = app.tabs_rect.x;
         if col < inner_x {
             return;
         }
         let dx = col - inner_x;
         let mut x: u16 = 0;
-        for (i, (id, name)) in TABS.iter().enumerate() {
-            // Title format: " {idx} {name} " (matches draw_tabs).
-            let title_len = format!(" {} {} ", i + 1, name).chars().count() as u16;
-            let divider_len: u16 = if i + 1 < TABS.len() { 3 } else { 0 }; // ratatui Tabs default divider " │ "
-            if dx >= x && dx < x + title_len {
-                app.tab = *id;
+        let divider_w: u16 = 1; // matches `.divider(" ")` in draw_tabs
+        for (i, (id, _en)) in TABS.iter().enumerate() {
+            let title = format!(" {} {} ", i + 1, tab_name(app.lang, *id));
+            let title_w = UnicodeWidthStr::width(title.as_str()) as u16;
+            if dx >= x && dx < x + title_w {
+                // Route through switch_tab so lazy-load (Network → SakuraFrp
+                // API) fires the same way `1`..`5` keyboard shortcuts do.
+                app.switch_tab(*id);
                 return;
             }
-            x = x + title_len + divider_len;
+            x = x + title_w + if i + 1 < TABS.len() { divider_w } else { 0 };
         }
         return;
     }
@@ -2878,6 +3165,7 @@ fn main() -> Result<()> {
             lang,
             select,
             picker,
+            overlay,
         }) => {
             let server_dir = resolve_server_dir(cli.server_dir.clone())?;
             return render_screenshot(
@@ -2888,6 +3176,7 @@ fn main() -> Result<()> {
                 &lang,
                 select,
                 picker.as_deref(),
+                overlay.as_deref(),
             );
         }
         Some(Cmd::Run) | None => {}
@@ -2950,25 +3239,28 @@ fn render_screenshot(
     lang: &str,
     select: usize,
     picker: Option<&str>,
+    overlay: Option<&str>,
 ) -> Result<()> {
     use ratatui::backend::TestBackend;
     let lang = Lang::from_code(lang);
     let mut app = App::new_with_lang(server_dir.to_path_buf(), lang)?;
     app.tab = match tab.to_ascii_lowercase().as_str() {
-        "worlds" => TabId::Worlds,
+        "overview" | "home" => TabId::Overview,
         "players" | "whitelist" | "ops" => TabId::Players,
-        "config" => TabId::Config,
-        "logs" => TabId::Logs,
-        "yaml" => TabId::Yaml,
-        "backups" => TabId::Backups,
-        "server" => TabId::Server,
-        "sakurafrp" | "frp" | "natfrp" => TabId::SakuraFrp,
+        "worlds" => TabId::Worlds,
+        // Aliases for old tab names — keep so existing screenshot scripts and
+        // CI snapshots don't break across the v0.16 restructure.
+        "settings" | "config" | "yaml" => TabId::Settings,
+        "network" | "sakurafrp" | "frp" | "natfrp" => TabId::Network,
+        // The old standalone tabs all roll into the four above; map them to
+        // the most useful destination so QA scripts still work.
+        "logs" | "backups" | "server" => TabId::Overview,
         other => anyhow::bail!("unknown tab: {}", other),
     };
-    // SakuraFrp tab fetches from the network on first visit. The screenshot
+    // Network tab fetches from the network on first visit. The screenshot
     // path bypasses switch_tab(), so trigger refresh_natfrp() explicitly here
     // — gives QA the same content the user would see after entering the tab.
-    if app.tab == TabId::SakuraFrp && app.natfrp_token.is_some() {
+    if app.tab == TabId::Network && app.natfrp_token.is_some() {
         app.refresh_natfrp();
     }
     // Allow QA to highlight a specific row to inspect its detail panel.
@@ -3000,6 +3292,22 @@ fn render_screenshot(
         };
         app.open_node_picker(purpose);
     }
+    if let Some(kind) = overlay {
+        app.overlay = match kind.to_ascii_lowercase().as_str() {
+            "help" => Overlay::Help,
+            "palette" => {
+                let mut state = ListState::default();
+                state.select(Some(0));
+                Overlay::Palette { state }
+            }
+            "logs" => Overlay::Logs(LogsOverlay {
+                source: LogsView::Server,
+                filter: LogsLevelFilter::All,
+                scroll_back: 0,
+            }),
+            other => anyhow::bail!("unknown overlay kind: {}", other),
+        };
+    }
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|f| ui(f, &mut app))?;
@@ -3030,6 +3338,35 @@ fn render_screenshot(
 mod tests {
     use super::*;
     use crate::ui::{fmt_age, op_level_meaning, split_list_detail};
+
+    #[test]
+    fn classify_status_uses_leading_glyph() {
+        assert_eq!(classify_status("✓ saved"), ToastKind::Ok);
+        assert_eq!(classify_status("  ✓ saved"), ToastKind::Ok);
+        assert_eq!(classify_status("✗ failed"), ToastKind::Err);
+        assert_eq!(classify_status("⚠ heads up"), ToastKind::Warn);
+        assert_eq!(classify_status("→ in progress"), ToastKind::Info);
+        assert_eq!(classify_status("Refreshed."), ToastKind::Info);
+        assert_eq!(classify_status(""), ToastKind::Info);
+    }
+
+    #[test]
+    fn toast_kind_durations_distinguish_severity() {
+        // Err / Warn linger longer so the user has time to read them; Ok / Info
+        // are quick (3s).
+        assert!(ToastKind::Err.duration() > ToastKind::Ok.duration());
+        assert!(ToastKind::Warn.duration() > ToastKind::Info.duration());
+        assert_eq!(ToastKind::Ok.duration(), ToastKind::Info.duration());
+    }
+
+    #[test]
+    fn logs_overlay_default_is_autotail_server() {
+        let s = LogsOverlay::default();
+        assert!(s.is_autotail());
+        assert_eq!(s.scroll_back, 0);
+        assert_eq!(s.source, LogsView::Server);
+        assert_eq!(s.filter, LogsLevelFilter::All);
+    }
 
     #[test]
     fn offline_uuid_format_and_version_bits() {
@@ -3354,9 +3691,12 @@ mod tests {
         // 5xx vs 4xx leak the actual code so the user can grep the dashboard.
         assert!(en_msgs[2].contains("503"));
         assert!(zh_msgs[3].contains("404"));
-        // Network suggests the mihomo workaround.
-        assert!(en_msgs[4].contains("sparkle"));
-        assert!(zh_msgs[4].contains("sparkle"));
+        // Network: should mention proxy as the most common workaround. The
+        // exact phrasing is human-friendly (no specific tool names like
+        // "sparkle"/"mihomo" — the user doesn't need to know the brand to
+        // act on it).
+        assert!(en_msgs[4].to_lowercase().contains("proxy"));
+        assert!(zh_msgs[4].contains("代理"));
         // Distinct messages per variant within the same language.
         let unique: std::collections::HashSet<&str> =
             en_msgs.iter().map(String::as_str).collect();
@@ -3618,8 +3958,10 @@ mod tests {
     }
 
     #[test]
-    fn server_action_labels_exist_in_both_langs() {
-        for action in SERVER_ACTIONS.iter().copied() {
+    fn palette_command_labels_exist_in_both_langs() {
+        // v0.16: PALETTE_COMMANDS replaced SERVER_ACTIONS as the menu the user
+        // actually interacts with. Each entry must have a label in both langs.
+        for action in PALETTE_COMMANDS.iter().copied() {
             let en = server_action_label(Lang::En, action);
             let zh = server_action_label(Lang::Zh, action);
             assert!(!en.is_empty());

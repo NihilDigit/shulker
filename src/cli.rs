@@ -69,6 +69,11 @@ pub enum Cmd {
         /// Useful for QA-ing the picker without building a write-side flow.
         #[arg(long)]
         picker: Option<String>,
+        /// v0.16 — open one of the new overlays before rendering. Values:
+        /// `help` | `palette` | `logs`. Stacks with `--tab` (the tab is still
+        /// painted underneath the overlay).
+        #[arg(long)]
+        overlay: Option<String>,
     },
 }
 

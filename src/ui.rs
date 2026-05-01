@@ -17,12 +17,12 @@ use crate::data::{
     YamlDisplay,
 };
 use crate::i18n::{
-    fmt_log_read_error, fmt_status_running, hint_for, property_metadata, property_zh,
-    server_action_label, tab_name, Lang, Strings,
+    fmt_log_read_error, fmt_status_running, hint_for, property_metadata, property_zh, tab_name,
+    Lang, Strings,
 };
 use crate::{
-    App, InputPrompt, LogsView, NodePickerPurpose, NodePickerState, TabId, YamlView,
-    SERVER_ACTIONS, TABS,
+    App, InputPrompt, LogsView, NodePickerPurpose, NodePickerState, Overlay, TabId, ToastKind,
+    YamlView, PALETTE_COMMANDS, TABS,
 };
 
 pub fn ui(f: &mut Frame, app: &mut App) {
@@ -35,7 +35,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
             Constraint::Length(1), // header: status + level + dir + primary connect chip
             Constraint::Length(1), // tabs
             Constraint::Min(3),    // content
-            Constraint::Length(3), // hints / status line
+            Constraint::Length(1), // hints (no border; toast floats above content)
         ])
         .split(f.area());
 
@@ -44,16 +44,32 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     app.tabs_rect = chunks[1];
     app.list_rect = chunks[2];
     match app.tab {
-        TabId::Worlds => draw_worlds(f, chunks[2], app),
+        TabId::Overview => draw_overview(f, chunks[2], app),
         TabId::Players => draw_players(f, chunks[2], app),
-        TabId::Config => draw_config(f, chunks[2], app),
-        TabId::Logs => draw_logs(f, chunks[2], app),
-        TabId::Yaml => draw_yaml(f, chunks[2], app),
-        TabId::Backups => draw_backups(f, chunks[2], app),
-        TabId::Server => draw_server(f, chunks[2], app),
-        TabId::SakuraFrp => draw_sakurafrp(f, chunks[2], app),
+        TabId::Worlds => draw_worlds(f, chunks[2], app),
+        // Settings tab — file picker → property editor / yaml row editor.
+        TabId::Settings => match &app.yaml_view {
+            YamlView::Files => draw_settings_files(f, chunks[2], app),
+            YamlView::Properties => draw_config(f, chunks[2], app),
+            YamlView::Editing { .. } => draw_yaml(f, chunks[2], app),
+        },
+        // Phase 8 will absorb frpc lifecycle + collapsed NIC list.
+        TabId::Network => draw_sakurafrp(f, chunks[2], app),
     }
     draw_hints(f, chunks[3], app);
+
+    // v0.16 — floating toast: render before overlays so a long-running
+    // overlay (like Logs) still surfaces transient feedback.
+    draw_toast(f, chunks[2], app);
+
+    // v0.16 — overlay (Help / Palette / Logs) covers tab content but sits
+    // under the node picker + prompt (those are deeper modals).
+    match &app.overlay {
+        Overlay::None => {}
+        Overlay::Help => draw_help_overlay(f, app),
+        Overlay::Palette { .. } => draw_palette_overlay(f, app),
+        Overlay::Logs(_) => draw_logs_overlay(f, app),
+    }
 
     // v0.13 — node picker overlays the entire frame above the tab content.
     // Drawn after the tab so it takes visual priority; key handling routes
@@ -101,7 +117,7 @@ fn draw_node_picker(f: &mut Frame, app: &mut App) {
         )),
         Line::from(Span::styled(
             format!(" {}", s.sf_picker_legend_vip),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )),
     ]);
     f.render_widget(legend, chunks[0]);
@@ -109,7 +125,7 @@ fn draw_node_picker(f: &mut Frame, app: &mut App) {
     let items: Vec<ListItem> = if picker.entries.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             s.sf_picker_no_nodes,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )))]
     } else {
         picker
@@ -117,7 +133,7 @@ fn draw_node_picker(f: &mut Frame, app: &mut App) {
             .iter()
             .map(|e| {
                 let star = if e.is_game { "★" } else { " " };
-                let star_color = if e.is_game { Color::Yellow } else { Color::DarkGray };
+                let star_color = if e.is_game { Color::Yellow } else { Color::Gray };
                 let host_marker = if e.host_present { " " } else { "·" };
                 let name_color = if e.is_game { Color::White } else { Color::Gray };
                 let truncated_desc = truncate_display(&e.description, 40);
@@ -125,7 +141,7 @@ fn draw_node_picker(f: &mut Frame, app: &mut App) {
                     Span::styled(format!(" {} ", star), Style::default().fg(star_color)),
                     Span::styled(
                         format!("#{:<5}", e.node_id),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     ),
                     Span::raw(" "),
                     Span::styled(
@@ -142,21 +158,23 @@ fn draw_node_picker(f: &mut Frame, app: &mut App) {
                         }),
                     ),
                     Span::raw("  "),
-                    Span::styled(truncated_desc, Style::default().fg(Color::DarkGray)),
+                    Span::styled(truncated_desc, Style::default().fg(Color::Gray)),
                 ]))
             })
             .collect()
     };
 
+    // Node picker is a modal overlay — keep the full border to make the
+    // "I'm in a dialog" state unambiguous.
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, chunks[1], &mut picker.list_state);
 
     let hint = Paragraph::new(Line::from(vec![Span::styled(
         format!(" {}", s.sf_picker_hint),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(Color::Gray),
     )]));
     f.render_widget(hint, chunks[2]);
 }
@@ -168,17 +186,321 @@ pub fn picker_is_open(state: &Option<NodePickerState>) -> bool {
     state.is_some()
 }
 
+/// `?` overlay — symbol legend at top, tab-grouped key list below. Read-only.
+/// Esc or `?` again closes.
+fn draw_help_overlay(f: &mut Frame, app: &App) {
+    let area = f.area();
+    f.render_widget(ratatui::widgets::Clear, area);
+    let zh = matches!(app.lang, Lang::Zh);
+
+    let title = if zh { " 帮助 (Esc 关闭) " } else { " Help (Esc closes) " };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Two-pane layout: legend on top (4 rows), keys below.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(3)])
+        .split(inner);
+
+    let legend = vec![
+        Line::from(Span::styled(
+            if zh { " 图例" } else { " Legend" },
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("●", Style::default().fg(Color::Green)),
+            Span::styled(if zh { " 进程在跑 / 当前活动" } else { " running / current" }, Style::default().fg(Color::Gray)),
+            Span::raw("   "),
+            Span::styled("○", Style::default().fg(Color::Gray)),
+            Span::styled(if zh { " 未运行 / 非活动" } else { " idle / not active" }, Style::default().fg(Color::Gray)),
+            Span::raw("   "),
+            Span::styled("✗", Style::default().fg(Color::Red)),
+            Span::styled(if zh { " 缺失 / 错误" } else { " missing / error" }, Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("▶", Style::default().fg(Color::Green)),
+            Span::styled(if zh { " 启用 / 在线" } else { " enabled / joined" }, Style::default().fg(Color::Gray)),
+            Span::raw("   "),
+            Span::styled("■", Style::default().fg(Color::Yellow)),
+            Span::styled(if zh { " 停用" } else { " disabled" }, Style::default().fg(Color::Gray)),
+            Span::raw("   "),
+            Span::styled("★n", Style::default().fg(Color::Yellow)),
+            Span::styled(if zh { " OP 等级 (n=1..4)" } else { " op level (n=1..4)" }, Style::default().fg(Color::Gray)),
+            Span::raw("   "),
+            Span::styled("⚠", Style::default().fg(Color::Yellow)),
+            Span::styled(if zh { " 警告" } else { " warning" }, Style::default().fg(Color::Gray)),
+        ]),
+        Line::raw(""),
+        Line::from(Span::styled(
+            if zh { " 颜色契约" } else { " Color contract" },
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("绿", Style::default().fg(Color::Green)),
+            Span::raw(if zh { "=正常  " } else { " = ok  " }),
+            Span::styled("黄", Style::default().fg(Color::Yellow)),
+            Span::raw(if zh { "=警告  " } else { " = warn  " }),
+            Span::styled("红", Style::default().fg(Color::Red)),
+            Span::raw(if zh { "=错误  " } else { " = err  " }),
+            Span::styled("青", Style::default().fg(Color::Cyan)),
+            Span::raw(if zh { "=焦点  " } else { " = focus  " }),
+            Span::styled("品红", Style::default().fg(Color::Magenta)),
+            Span::raw(if zh { "=frp 地址" } else { " = frp address" }),
+        ]),
+    ];
+    f.render_widget(Paragraph::new(legend).wrap(Wrap { trim: false }), chunks[0]);
+
+    // Tab-grouped key list. Two columns to fit on 32-row terminals.
+    let key_block = if zh { vec![
+        ("全局", vec![
+            ("S / X / R", "启动 / 停止 / 重启服务器"),
+            ("B", "立即跑 backup.sh"),
+            ("L", "全屏日志（可滚动 + 等级过滤）"),
+            (": (冒号)", "命令面板（运维杂项）"),
+            ("? / Esc", "本帮助 / 关闭弹窗"),
+            ("1-5", "切换到对应 tab"),
+            ("Tab / Shift-Tab", "下一 / 上一 tab"),
+            ("D / T / r", "切目录 / 切语言 / 刷新"),
+            ("q", "退出"),
+        ]),
+        ("玩家", vec![
+            ("Enter", "切换白名单"),
+            ("o / ←/→", "切换 OP / 切级别 1-4"),
+            ("a / d", "添加 / 清除"),
+            ("w", "白名单总开关"),
+        ]),
+        ("世界", vec![
+            ("Enter", "切到该世界（需先停服）"),
+            ("N", "新建世界"),
+        ]),
+        ("网络", vec![
+            ("Enter", "复制公网地址"),
+            ("i", "一键配置（下载 frpc + 启用所有隧道）"),
+            ("e / x", "启用 / 停用选中隧道"),
+            ("c / m / d", "创建 / 迁移 / 删除"),
+            ("t / o", "设置 token / 打开 natfrp.com"),
+        ]),
+    ] } else { vec![
+        ("Global", vec![
+            ("S / X / R", "start / stop / restart server"),
+            ("B", "run backup.sh now"),
+            ("L", "fullscreen logs (scroll + level filter)"),
+            (": (colon)", "command palette (advanced ops)"),
+            ("? / Esc", "this help / close overlay"),
+            ("1-5", "jump to tab"),
+            ("Tab / Shift-Tab", "next / prev tab"),
+            ("D / T / r", "switch dir / lang / refresh"),
+            ("q", "quit"),
+        ]),
+        ("Players", vec![
+            ("Enter", "toggle whitelist"),
+            ("o / ←/→", "toggle op / cycle level 1-4"),
+            ("a / d", "add / purge"),
+            ("w", "whitelist on/off"),
+        ]),
+        ("Worlds", vec![
+            ("Enter", "switch to world (server must be stopped)"),
+            ("N", "new world"),
+        ]),
+        ("Network", vec![
+            ("Enter", "copy public address"),
+            ("i", "one-key setup (download frpc + enable all)"),
+            ("e / x", "enable / disable selected"),
+            ("c / m / d", "create / migrate / delete"),
+            ("t / o", "set token / open natfrp.com"),
+        ]),
+    ] };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (heading, entries) in key_block {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            format!(" {}", heading),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        for (key, desc) in entries {
+            lines.push(Line::from(vec![
+                Span::raw("   "),
+                Span::styled(format!("{:<18}", key), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(desc.to_string(), Style::default().fg(Color::Gray)),
+            ]));
+        }
+    }
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), chunks[1]);
+}
+
+/// `:` overlay — command palette. List of advanced operations migrated from
+/// the deleted Server tab. Enter executes; Esc closes.
+fn draw_palette_overlay(f: &mut Frame, app: &mut App) {
+    let area = centered_rect(70, 16, f.area());
+    f.render_widget(ratatui::widgets::Clear, area);
+    let zh = matches!(app.lang, Lang::Zh);
+    let title = if zh { " : 命令面板 " } else { " : Command palette " };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
+        .split(inner);
+
+    let items: Vec<ListItem> = PALETTE_COMMANDS
+        .iter()
+        .map(|a| {
+            ListItem::new(Line::from(vec![
+                Span::raw(" "),
+                Span::styled(
+                    crate::i18n::server_action_label(app.lang, *a).to_string(),
+                    Style::default().fg(Color::White),
+                ),
+            ]))
+        })
+        .collect();
+
+    if let Overlay::Palette { state } = &mut app.overlay {
+        let list = List::new(items)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+            .highlight_symbol("> ");
+        f.render_stateful_widget(list, chunks[0], state);
+    }
+
+    let hint = Paragraph::new(Line::from(Span::styled(
+        if zh {
+            " ↑↓ 选择   Enter 执行   Esc 关闭"
+        } else {
+            " ↑↓ select   Enter execute   Esc close"
+        },
+        Style::default().fg(Color::Gray),
+    )));
+    f.render_widget(hint, chunks[1]);
+}
+
+/// `L` overlay — fullscreen scrollable log viewer. Phase 4 fills in the real
+/// scroll/filter/source logic; Phase 3 stub renders the existing tail with a
+/// header showing the current source + filter state.
+fn draw_logs_overlay(f: &mut Frame, app: &App) {
+    use unicode_width::UnicodeWidthStr as _;
+    let area = f.area();
+    f.render_widget(ratatui::widgets::Clear, area);
+    let zh = matches!(app.lang, Lang::Zh);
+
+    let Overlay::Logs(state) = &app.overlay else { return };
+
+    let source_label = match (state.source, zh) {
+        (LogsView::Server, true) => "服务器日志",
+        (LogsView::Server, false) => "server log",
+        (LogsView::Frpc, true) => "网络转发日志",
+        (LogsView::Frpc, false) => "tunnel log",
+    };
+    let filter_label = match (state.filter, zh) {
+        (crate::LogsLevelFilter::All, true) => "全部",
+        (crate::LogsLevelFilter::All, false) => "ALL",
+        (crate::LogsLevelFilter::Info, _) => "INFO",
+        (crate::LogsLevelFilter::Warn, _) => "WARN",
+        (crate::LogsLevelFilter::Error, _) => "ERROR",
+    };
+    let title = if zh {
+        format!(" 日志 — {} · 等级 {} (Esc 关闭) ", source_label, filter_label)
+    } else {
+        format!(" Logs — {} · level {} (Esc closes) ", source_label, filter_label)
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Body: pull from current source. Simple tail for Phase 3; Phase 4 adds
+    // scroll offset + filter respect.
+    let body: String = match state.source {
+        LogsView::Server => {
+            let p = app.server_dir.join("logs/latest.log");
+            std::fs::read_to_string(&p).unwrap_or_else(|e| {
+                fmt_log_read_error(app.lang, &e.to_string())
+            })
+        }
+        LogsView::Frpc => {
+            let session = crate::sys::frpc_tmux_session_name(&app.server_dir);
+            crate::data::tmux_capture_pane(&session, 1000).unwrap_or_else(|e| {
+                if zh {
+                    format!("(网络转发尚未启动 — 详情：{})", e)
+                } else {
+                    format!("(tunnel not running yet — detail: {})", e)
+                }
+            })
+        }
+    };
+    let mut lines_in: Vec<&str> = body.lines().collect();
+    if state.filter != crate::LogsLevelFilter::All {
+        lines_in.retain(|l| line_matches_level(l, state.filter));
+    }
+
+    let take = (inner.height as usize).max(1);
+    let total = lines_in.len();
+    // Clamp scroll_back to [0, max_back] where max_back = total.saturating_sub(take).
+    // 0 = autotail (window aligned with last `take` lines).
+    let max_back = total.saturating_sub(take);
+    let scroll_back = state.scroll_back.min(max_back);
+    let start = total.saturating_sub(take + scroll_back);
+    let end = (start + take).min(total);
+    let visible: &[&str] = if total == 0 { &[] } else { &lines_in[start..end] };
+
+    let rendered: Vec<Line> = visible
+        .iter()
+        .map(|line| Line::from(colorize_log_line(line)))
+        .collect();
+    let p = Paragraph::new(rendered).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+
+    // Bottom-right: position indicator. "tail" while autotail, otherwise
+    // current line / total — helps the user know if they've left the tail.
+    let pos = if state.is_autotail() {
+        if zh { "末尾 (autotail)".to_string() } else { "tail (autotail)".to_string() }
+    } else {
+        format!("{}/{}", end, total)
+    };
+    let pos_w = pos.width() as u16;
+    let pos_rect = Rect {
+        x: area.x + area.width.saturating_sub(pos_w + 2),
+        y: area.y + area.height.saturating_sub(1),
+        width: pos_w,
+        height: 1,
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(pos, Style::default().fg(Color::Gray))),
+        pos_rect,
+    );
+}
+
+/// Phase 3 stub level matcher — Phase 4 will replace with proper severity
+/// classification (currently lives in colorize_log_line as substring scan).
+fn line_matches_level(line: &str, filter: crate::LogsLevelFilter) -> bool {
+    let lower = line.to_ascii_lowercase();
+    let is_err = line.contains("[ERROR]") || lower.contains("/error]:");
+    let is_warn = line.contains("[WARN]") || lower.contains("/warn]:");
+    match filter {
+        crate::LogsLevelFilter::All => true,
+        crate::LogsLevelFilter::Error => is_err,
+        crate::LogsLevelFilter::Warn => is_warn || is_err,
+        crate::LogsLevelFilter::Info => !is_err && !is_warn,
+    }
+}
+
 /// One-line header: status + level + dir + primary connect chip.
 /// No border — saves vertical space and keeps key info above the tab bar.
 /// Click the chip to copy `<ip>:<port>` to the clipboard via wl-copy.
+/// One-line "diagnose-at-a-glance" header. Format:
+///   `mc <state> <world> · ▶<online>     LAN <ip>:<port>   frp <state> [<addr>]    ?`
+/// State glyph escalates to ⚠ if recent log activity contains errors. Click
+/// either chip to copy that address. Path & "目录:" label are deliberately
+/// dropped — `D` toasts the dir on switch and `?` shows it on demand.
 fn draw_header_line(f: &mut Frame, area: Rect, app: &mut App) {
     use unicode_width::UnicodeWidthStr;
-
-    let s = app.lang.s();
-    let pid_text = match app.pid {
-        Some(p) => Span::styled(fmt_status_running(app.lang, p), Style::default().fg(Color::Green)),
-        None => Span::styled(s.status_stopped, Style::default().fg(Color::DarkGray)),
-    };
+    let zh = matches!(app.lang, Lang::Zh);
 
     let nics = detect_interfaces();
     let port: u16 = get_property(&app.properties, "server-port")
@@ -187,66 +509,120 @@ fn draw_header_line(f: &mut Frame, area: Rect, app: &mut App) {
     let primary = nics.iter().find(|n| {
         !matches!(n.kind, NicKind::Loopback | NicKind::Docker | NicKind::Tun)
     });
+    let frp_addr = app.effective_sakurafrp_address();
+    let online_count = app.players.iter().filter(|p| p.is_online).count();
 
     app.join_chips.clear();
 
-    // Build the line as spans; track chip x by accumulating display widths.
-    let sep = "   ";
+    // ---- Left half: server state + world + online ----
     let mut spans: Vec<Span> = vec![
-        Span::styled(s.server_label, Style::default().add_modifier(Modifier::DIM)),
-        pid_text,
-        Span::raw(sep),
-        Span::styled(s.level_label, Style::default().add_modifier(Modifier::DIM)),
-        Span::styled(app.current_level().to_string(), Style::default().fg(Color::Cyan)),
-        Span::raw(sep),
-        Span::styled(s.dir_label, Style::default().add_modifier(Modifier::DIM)),
-        Span::raw(app.server_dir.display().to_string()),
-        Span::raw(sep),
+        Span::styled(" mc ", Style::default().fg(Color::Gray)),
     ];
-
-    if let Some(n) = primary {
-        let kind_label = nic_kind_label(app.lang, n.kind);
-        let kind_span_text = format!("[{}]", kind_label);
-        let chip_text = format!("{}:{}", n.ip, port);
-
-        // Sum the display width of every span before the chip — that's where the
-        // chip starts on screen. UnicodeWidthStr handles wide CJK + emoji correctly.
-        let mut chip_x = area.x;
-        for sp in &spans {
-            chip_x = chip_x.saturating_add(UnicodeWidthStr::width(sp.content.as_ref()) as u16);
-        }
-        chip_x = chip_x.saturating_add(UnicodeWidthStr::width(kind_span_text.as_str()) as u16);
-        chip_x = chip_x.saturating_add(1); // space between [kind] and chip
-        let chip_w = UnicodeWidthStr::width(chip_text.as_str()) as u16;
-        let chip_rect = Rect {
-            x: chip_x,
-            y: area.y,
-            width: chip_w,
-            height: 1,
-        };
-        app.join_chips.push((chip_rect, chip_text.clone()));
-
+    match app.pid {
+        Some(_p) => spans.push(Span::styled(
+            "●",
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+        )),
+        None => spans.push(Span::styled(
+            "○",
+            Style::default().fg(Color::Gray),
+        )),
+    }
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        app.current_level().to_string(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
+    if app.pid.is_some() {
+        spans.push(Span::raw(" · "));
         spans.push(Span::styled(
-            kind_span_text,
-            Style::default().fg(nic_kind_color(n.kind)).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            chip_text,
+            format!("▶{}", online_count),
             Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+                .fg(if online_count > 0 { Color::Green } else { Color::Gray })
+                .add_modifier(Modifier::BOLD),
         ));
     } else {
+        spans.push(Span::raw("  "));
         spans.push(Span::styled(
-            match app.lang {
-                Lang::En => "(no LAN/Public IPv4)",
-                Lang::Zh => "(无可用 IPv4)",
-            },
-            Style::default().fg(Color::DarkGray),
+            if zh { "(S 启动)" } else { "(S to start)" },
+            Style::default().fg(Color::Gray),
         ));
     }
 
+    // ---- Compute right-half spans (LAN + frp + ?) so we can right-align ----
+    let mut right_spans: Vec<Span> = Vec::new();
+    if let Some(n) = primary {
+        let kind_label = nic_kind_label(app.lang, n.kind);
+        right_spans.push(Span::styled(
+            format!("{} ", kind_label),
+            Style::default().fg(nic_kind_color(n.kind)),
+        ));
+        let lan_chip = format!("{}:{}", n.ip, port);
+        right_spans.push(Span::styled(
+            lan_chip.clone(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+        right_spans.push(Span::raw("   "));
+    }
+    let (frp_marker, frp_color) = if app.frpc_pid.is_some() {
+        ("●", Color::Green)
+    } else if app.frpc_binary.is_none() {
+        ("✗", Color::Red)
+    } else if !app.frpc_enabled_ids.is_empty() {
+        ("○", Color::Yellow)
+    } else {
+        ("○", Color::Gray)
+    };
+    right_spans.push(Span::styled("frp ", Style::default().fg(Color::Gray)));
+    right_spans.push(Span::styled(frp_marker, Style::default().fg(frp_color)));
+    if let Some(addr) = &frp_addr {
+        right_spans.push(Span::raw(" "));
+        right_spans.push(Span::styled(
+            addr.clone(),
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        ));
+    }
+    right_spans.push(Span::raw("   "));
+    right_spans.push(Span::styled("?", Style::default().fg(Color::Gray)));
+    right_spans.push(Span::raw(" "));
+
+    // Compute widths for click-region tracking.
+    let left_w: u16 = spans.iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+        .sum();
+    let right_w: u16 = right_spans.iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()) as u16)
+        .sum();
+    let pad = area.width.saturating_sub(left_w).saturating_sub(right_w);
+    spans.push(Span::raw(" ".repeat(pad as usize)));
+
+    // Track LAN chip rect for click-to-copy. We need the x position where the
+    // chip text starts — which is left_w + pad + (kind_label width) + 1 (for
+    // the space after kind_label).
+    if let Some(n) = primary {
+        let kind_w = UnicodeWidthStr::width(format!("{} ", nic_kind_label(app.lang, n.kind)).as_str()) as u16;
+        let chip_text = format!("{}:{}", n.ip, port);
+        let chip_w = UnicodeWidthStr::width(chip_text.as_str()) as u16;
+        let chip_x = area.x + left_w + pad + kind_w;
+        app.join_chips.push((Rect { x: chip_x, y: area.y, width: chip_w, height: 1 }, chip_text));
+    }
+    if let Some(addr) = &frp_addr {
+        // frp chip x: left_w + pad + (kind+chip+pad + "frp " + marker + " ").
+        // Easier: walk right_spans up to "frp " then advance through marker
+        // and " ", that's where the addr begins.
+        let mut x = area.x + left_w + pad;
+        for sp in &right_spans {
+            // The first span whose content equals the address is our chip.
+            if sp.content.as_ref() == addr.as_str() {
+                let w = UnicodeWidthStr::width(addr.as_str()) as u16;
+                app.join_chips.push((Rect { x, y: area.y, width: w, height: 1 }, addr.clone()));
+                break;
+            }
+            x += UnicodeWidthStr::width(sp.content.as_ref()) as u16;
+        }
+    }
+
+    spans.extend(right_spans);
     let p = Paragraph::new(Line::from(spans));
     f.render_widget(p, area);
 }
@@ -256,20 +632,478 @@ fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, (id, _en))| {
-            Line::from(format!(" {} {} ", i + 1, tab_name(app.lang, *id)))
+            Line::from(vec![
+                Span::styled(
+                    format!(" {} ", i + 1),
+                    Style::default().fg(Color::Gray),
+                ),
+                Span::raw(format!("{} ", tab_name(app.lang, *id))),
+            ])
         })
         .collect();
     let selected = TABS.iter().position(|(t, _)| *t == app.tab).unwrap_or(0);
+    // No background block — selected tab gets bold + underline only. Reads the
+    // same against any terminal theme; cyan reverse was always the loud one.
+    // Empty divider (default is `│`) — spacing alone is enough.
     let tabs = Tabs::new(titles)
+        .divider(" ")
         .select(selected)
-        .style(Style::default().fg(Color::White))
+        .style(Style::default().fg(Color::Gray))
         .highlight_style(
             Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
         );
     f.render_widget(tabs, area);
+}
+
+/// Overview tab — the "is everything OK" landing page. Two regions only:
+///   1. A single line with a state sentence + 1-line action hints.
+///   2. Filtered + translated recent activity (joins / leaves / start / stop /
+///      WARN / ERROR), one event per row, max ~last 12.
+///
+/// Server-state, level name, frp address — all in the header bar already, no
+/// reason to repeat them here. Online players, when any, get a tiny inline
+/// list under the status line.
+fn draw_overview(f: &mut Frame, area: Rect, app: &mut App) {
+    let zh = matches!(app.lang, Lang::Zh);
+    let online: Vec<&crate::data::PlayerEntry> = app
+        .players
+        .iter()
+        .filter(|p| p.is_online)
+        .collect();
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::raw(""));
+
+    // ── Status line ──
+    let status = match app.pid {
+        Some(_) if !online.is_empty() => Line::from(vec![
+            Span::raw("  "),
+            Span::styled("●", Style::default().fg(Color::Green)),
+            Span::raw("  "),
+            Span::styled(
+                if zh {
+                    format!("{} 人在线", online.len())
+                } else {
+                    format!("{} online", online.len())
+                },
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("    "),
+            dim_kbd("Y"),
+            Span::styled(
+                if zh { " 复制邀请   " } else { " copy invite   " },
+                Style::default().fg(Color::Gray),
+            ),
+            dim_kbd("X"),
+            Span::styled(
+                if zh { " 关服   " } else { " stop   " },
+                Style::default().fg(Color::Gray),
+            ),
+            dim_kbd("B"),
+            Span::styled(
+                if zh { " 备份" } else { " backup" },
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        Some(_) => Line::from(vec![
+            Span::raw("  "),
+            Span::styled("●", Style::default().fg(Color::Green)),
+            Span::raw("  "),
+            Span::styled(
+                if zh { "服务器运行中 · 暂无人在线" } else { "running · nobody online" },
+                Style::default().fg(Color::White),
+            ),
+            Span::raw("    "),
+            dim_kbd("Y"),
+            Span::styled(
+                if zh { " 复制邀请   " } else { " copy invite   " },
+                Style::default().fg(Color::Gray),
+            ),
+            dim_kbd("X"),
+            Span::styled(
+                if zh { " 关服" } else { " stop" },
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        None => Line::from(vec![
+            Span::raw("  "),
+            Span::styled("○", Style::default().fg(Color::Gray)),
+            Span::raw("  "),
+            Span::styled(
+                if zh { "服务器未启动" } else { "server stopped" },
+                Style::default().fg(Color::White),
+            ),
+            Span::raw("    "),
+            dim_kbd("S"),
+            Span::styled(
+                if zh { " 启动   " } else { " start   " },
+                Style::default().fg(Color::Gray),
+            ),
+            dim_kbd("N"),
+            Span::styled(
+                if zh { " 新建世界   " } else { " new world   " },
+                Style::default().fg(Color::Gray),
+            ),
+            dim_kbd("R"),
+            Span::styled(
+                if zh { " 重启" } else { " restart" },
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+    };
+    lines.push(status);
+
+    // Online players (compact inline list). Skipped when stopped or empty.
+    if !online.is_empty() {
+        lines.push(Line::raw(""));
+        for p in online.iter().take(6) {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("▶ ", Style::default().fg(Color::Green)),
+                Span::styled(
+                    p.name.clone(),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+        }
+        if online.len() > 6 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {}",
+                    if zh {
+                        format!("… 还有 {} 人", online.len() - 6)
+                    } else {
+                        format!("… {} more", online.len() - 6)
+                    }
+                ),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
+    // ── Activity section ──
+    lines.push(Line::raw(""));
+    lines.push(Line::raw(""));
+    lines.push(divider_with_action_hint(
+        area.width,
+        if zh { " 最近活动 " } else { " Recent activity " },
+        if zh { "L 完整日志" } else { "L full log" },
+    ));
+    lines.push(Line::raw(""));
+
+    // Filter + translate. Walk in reverse, take only "interesting" events.
+    let body = read_recent_log_tail(&app.server_dir, app.lang);
+    let used_above = lines.len() as u16;
+    let event_room = (area.height as usize)
+        .saturating_sub(used_above as usize)
+        .max(1);
+    let events = filter_overview_events(&body, app.lang, event_room);
+    if events.is_empty() {
+        lines.push(Line::from(Span::styled(
+            if zh {
+                "    (没有可显示的事件 — 启动一次服务器再回来)"
+            } else {
+                "    (no events to show — start the server then come back)"
+            },
+            Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        lines.extend(events);
+    }
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, area);
+}
+
+/// Render a `K` keyboard chip — single bold cyan cap so the eye finds it
+/// even amid darkgray hint prose.
+fn dim_kbd(key: &str) -> Span<'static> {
+    Span::styled(
+        key.to_string(),
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )
+}
+
+/// Build a section divider that fills `width`: `── <title> ──...── <hint> ──`.
+/// The hint segment is right-aligned and dim-cyan to suggest a clickable key.
+fn divider_with_action_hint(width: u16, title: &str, hint: &str) -> Line<'static> {
+    use unicode_width::UnicodeWidthStr;
+    let title_w = UnicodeWidthStr::width(title) as u16;
+    let hint_w = UnicodeWidthStr::width(hint) as u16;
+    // Layout: " ── <title> " <fill> " <hint> ──"
+    // Reserve: 4 chars `── ` prefix, 1 leading space, 1 trailing ` ──` (3 chars)
+    //          + 1 space between title and fill, 1 between fill and hint
+    let chrome_w: u16 = 1 + 2 + 1 /*"── "*/ + 1 + 2 /*" ──"*/;
+    let inside = width.saturating_sub(chrome_w + title_w + hint_w + 2);
+    let fill = "─".repeat(inside as usize);
+    Line::from(vec![
+        Span::styled(" ── ", Style::default().fg(Color::Gray)),
+        Span::styled(
+            title.trim().to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(fill, Style::default().fg(Color::Gray)),
+        Span::raw(" "),
+        Span::styled(
+            hint.to_string(),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled(" ──", Style::default().fg(Color::Gray)),
+    ])
+}
+
+/// Walk `body` in reverse, collect "interesting" events, translate to a
+/// localized one-line `Line`. Stops at `max` events; returns oldest-first.
+/// Filters out chunk system / I/O halt / save spam — only joins / leaves /
+/// disconnects / errors / warns / server start-stop / whitelist denials.
+fn filter_overview_events(body: &str, lang: Lang, max: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(max);
+    for line in body.lines().rev() {
+        if let Some(ev) = translate_event(line, lang) {
+            out.push(ev);
+            if out.len() >= max {
+                break;
+            }
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// Match a single Paper/Purpur log line against the small set of "interesting
+/// to the host" patterns and return a translated `Line`. Returns `None` for
+/// noise.
+fn translate_event(line: &str, lang: Lang) -> Option<Line<'static>> {
+    let zh = matches!(lang, Lang::Zh);
+    // Extract `[HH:MM:SS]` timestamp prefix. If absent, skip — we don't
+    // surface untimestamped output.
+    let close = line.find(']')?;
+    let ts_inner = line.get(1..close)?;
+    if !is_hms(ts_inner) {
+        return None;
+    }
+    let ts: String = ts_inner[..5].to_string(); // HH:MM
+    let after = &line[close + 1..];
+
+    // Player joined.
+    if let Some(name) = strip_player_action(after, "joined the game") {
+        return Some(format_event(
+            &ts,
+            "→",
+            Color::Green,
+            &name,
+            if zh { "加入" } else { "joined" },
+            Color::Green,
+        ));
+    }
+    // Player left.
+    if let Some(name) = strip_player_action(after, "left the game") {
+        return Some(format_event(
+            &ts,
+            "←",
+            Color::Cyan,
+            &name,
+            if zh { "离开" } else { "left" },
+            Color::Cyan,
+        ));
+    }
+    // Whitelist denial.
+    if line.contains("not whitelisted on this server") {
+        let name = extract_name_field(line).unwrap_or_else(|| "?".into());
+        return Some(format_event(
+            &ts,
+            "✗",
+            Color::Red,
+            &name,
+            if zh { "被拒（不在白名单）" } else { "denied (not whitelisted)" },
+            Color::Red,
+        ));
+    }
+    // Server done starting.
+    if line.contains("Done (") && line.contains("s)! For help, type") {
+        let dur = extract_done_duration(line).unwrap_or_else(|| "?".into());
+        return Some(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{}  ", ts), Style::default().fg(Color::Gray)),
+            Span::styled("● ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                if zh {
+                    format!("服务器启动完成 ({})", dur)
+                } else {
+                    format!("server started ({})", dur)
+                },
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    // Server stopping.
+    if line.contains("Stopping the server") || line.contains("Stopping server") {
+        return Some(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{}  ", ts), Style::default().fg(Color::Gray)),
+            Span::styled("○ ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                if zh { "服务器停止" } else { "server stopping" },
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
+    // ERROR.
+    if line.contains("[ERROR]") || line.to_ascii_lowercase().contains("/error]:") {
+        let msg = clean_log_msg(after);
+        return Some(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{}  ", ts), Style::default().fg(Color::Gray)),
+            Span::styled("⚠ ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                truncate_display(&msg, 90),
+                Style::default().fg(Color::Red),
+            ),
+        ]));
+    }
+    // WARN.
+    if line.contains("[WARN]") || line.to_ascii_lowercase().contains("/warn]:") {
+        let msg = clean_log_msg(after);
+        return Some(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{}  ", ts), Style::default().fg(Color::Gray)),
+            Span::styled("⚠ ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                truncate_display(&msg, 90),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+    }
+    None
+}
+
+/// Format a `<ts>  <glyph> <subject> <action>` event row.
+fn format_event(
+    ts: &str,
+    glyph: &str,
+    glyph_color: Color,
+    subject: &str,
+    action: &str,
+    action_color: Color,
+) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("   "),
+        Span::styled(format!("{}  ", ts), Style::default().fg(Color::Gray)),
+        Span::styled(
+            format!("{} ", glyph),
+            Style::default().fg(glyph_color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            subject.to_string(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+        Span::styled(action.to_string(), Style::default().fg(action_color)),
+    ])
+}
+
+/// Match `[Server thread/INFO]: <name> <action>` and return `<name>` if the
+/// action suffix matches. Returns None for non-matching lines.
+fn strip_player_action(after: &str, action: &str) -> Option<String> {
+    let after = after.trim_start();
+    let bracket_close = after.find("]:")?;
+    let body = after[bracket_close + 2..].trim();
+    let stripped = body.strip_suffix(action)?;
+    let name = stripped.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
+/// Pull the username out of a `name=<X>,` field (used in the disconnect /
+/// not-whitelisted log lines from Paper).
+fn extract_name_field(line: &str) -> Option<String> {
+    let i = line.find("name=")?;
+    let from = &line[i + 5..];
+    let end = from
+        .find(|c: char| c == ',' || c == ']' || c == ' ')
+        .unwrap_or(from.len());
+    let name = from[..end].trim().to_string();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+/// Pull `Xs` out of a `Done (Xs)! For help, type` line.
+fn extract_done_duration(line: &str) -> Option<String> {
+    let i = line.find("Done (")?;
+    let from = &line[i + 6..];
+    let end = from.find("s)")?;
+    Some(format!("{}s", &from[..end]))
+}
+
+/// Strip the `[<thread>/<level>]: ` prefix from a log message body, leaving
+/// just the human-readable part.
+fn clean_log_msg(after: &str) -> String {
+    if let Some(close) = after.find("]:") {
+        after[close + 2..].trim().to_string()
+    } else {
+        after.trim().to_string()
+    }
+}
+
+/// Cheap "is this `HH:MM:SS`?" check — at least 8 chars, colons at 2 and 5.
+fn is_hms(s: &str) -> bool {
+    s.len() >= 8 && s.as_bytes().get(2) == Some(&b':') && s.as_bytes().get(5) == Some(&b':')
+}
+
+/// Read the tail of `logs/latest.log` if present. Caller cares only about a
+/// few lines; we return the full body and let the caller take the bottom.
+fn read_recent_log_tail(server_dir: &std::path::Path, lang: Lang) -> String {
+    let p = server_dir.join("logs/latest.log");
+    if !p.exists() {
+        return lang.s().no_logs_yet.to_string();
+    }
+    fs::read_to_string(&p).unwrap_or_else(|e| fmt_log_read_error(lang, &e.to_string()))
+}
+
+/// Compose the multi-line share text the user copies with `Y`. Picks frp if
+/// configured and reachable; otherwise LAN. `lan` is `(ip, port)` — the IP is
+/// passed by display string so the caller can pick whichever Ipv4Addr-display
+/// form they want without re-formatting here.
+pub fn build_share_text(
+    app: &App,
+    lan: Option<(String, u16)>,
+    frp: Option<&str>,
+) -> String {
+    let zh = matches!(app.lang, Lang::Zh);
+    let level = app.current_level().to_string();
+    let mut out = String::new();
+    if zh {
+        out.push_str(&format!("MC 服务器：{}\n", level));
+        if let Some(addr) = frp {
+            out.push_str(&format!("地址（公网）：{}\n", addr));
+            if let Some((ip, port)) = lan.as_ref() {
+                out.push_str(&format!("（同局域网备用：{}:{}）\n", ip, port));
+            }
+        } else if let Some((ip, port)) = lan {
+            out.push_str(&format!("地址（局域网）：{}:{}\n", ip, port));
+        }
+        out.push_str("把你的 Minecraft 用户名发我，加进白名单后就能进。\n");
+    } else {
+        out.push_str(&format!("MC server: {}\n", level));
+        if let Some(addr) = frp {
+            out.push_str(&format!("Address (public): {}\n", addr));
+            if let Some((ip, port)) = lan.as_ref() {
+                out.push_str(&format!("(same LAN fallback: {}:{})\n", ip, port));
+            }
+        } else if let Some((ip, port)) = lan {
+            out.push_str(&format!("Address (LAN): {}:{}\n", ip, port));
+        }
+        out.push_str("Send me your Minecraft username and I'll whitelist you.\n");
+    }
+    out
 }
 
 fn draw_worlds(f: &mut Frame, area: Rect, app: &mut App) {
@@ -288,15 +1122,15 @@ fn draw_worlds(f: &mut Frame, area: Rect, app: &mut App) {
                 Span::styled(format!("{:30}", w.name), Style::default().fg(Color::White)),
                 Span::styled(
                     format!("{:>10}  ", fmt_bytes(w.size_bytes)),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 ),
-                Span::styled(when, Style::default().fg(Color::DarkGray)),
+                Span::styled(when, Style::default().fg(Color::Gray)),
             ]))
         })
         .collect();
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_worlds))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::TOP).title(app.lang.s().title_worlds))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, list_area, &mut app.worlds_state);
     if let Some(da) = detail_area {
@@ -319,7 +1153,7 @@ pub fn split_list_detail(area: Rect) -> (Rect, Option<Rect>) {
 
 fn kv_line_label(label: &str, value: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{}: ", label), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{}: ", label), Style::default().fg(Color::Gray)),
         Span::styled(value.to_string(), Style::default().fg(Color::White)),
     ])
 }
@@ -333,11 +1167,17 @@ fn kv_line_bold(value: &str, color: Color) -> Line<'static> {
 
 fn draw_world_detail(f: &mut Frame, area: Rect, app: &App) {
     let s = app.lang.s();
-    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
-    let lines: Vec<Line> = match app.worlds_state.selected().and_then(|i| app.worlds.get(i)) {
+    let zh = matches!(app.lang, Lang::Zh);
+    // Detail panel: TOP separator (with title) + LEFT separator (vertical
+    // line between list and detail). Together they form an "L" that reads as
+    // a clear section divider without a full box.
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::LEFT)
+        .title(s.detail_title);
+    let mut lines: Vec<Line> = match app.worlds_state.selected().and_then(|i| app.worlds.get(i)) {
         None => vec![Line::from(Span::styled(
             s.detail_no_selection,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))],
         Some(w) => {
             let when = w
@@ -357,6 +1197,78 @@ fn draw_world_detail(f: &mut Frame, area: Rect, app: &App) {
             ]
         }
     };
+
+    // v0.16 — Backups roll into the Worlds detail panel (the standalone
+    // Backups tab is gone). Show the most recent N for context. If a backup
+    // filename contains the world name, prefer those — otherwise just the
+    // newest. This is read-only; restore is intentionally still manual.
+    let world_name = app
+        .worlds_state
+        .selected()
+        .and_then(|i| app.worlds.get(i))
+        .map(|w| w.name.as_str());
+    let candidates: Vec<&crate::data::BackupEntry> = if let Some(name) = world_name {
+        let mut filtered: Vec<&crate::data::BackupEntry> = app
+            .backups
+            .iter()
+            .filter(|b| b.name.contains(name))
+            .collect();
+        if filtered.is_empty() {
+            filtered = app.backups.iter().collect();
+        }
+        filtered
+    } else {
+        app.backups.iter().collect()
+    };
+    let total = candidates.len();
+    if total > 0 {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(Span::styled(
+            if zh {
+                format!("── 备份 ({}) ──────────", total)
+            } else {
+                format!("── Backups ({}) ──────────", total)
+            },
+            Style::default().fg(Color::Gray),
+        )));
+        let now = chrono::Local::now();
+        for b in candidates.iter().take(5) {
+            let age = b
+                .modified
+                .map(|t| fmt_age(now - t))
+                .unwrap_or_else(|| "?".into());
+            // Strip the redundant `<world>-` prefix and `.tar.zst` suffix —
+            // what's left is the timestamp the user cares about. Keeps the
+            // line readable in the 30%-wide detail column.
+            let short = backup_short_name(&b.name, world_name);
+            // Compact one-line format that fits the ~38-col detail column:
+            // `· <age>  <short_name>`. Size is dropped — backups for one
+            // world are similar size, the user already saw total size above.
+            lines.push(Line::from(vec![
+                Span::styled(" · ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    format!("{:>8}", age),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    truncate_display(&short, 22),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+        if total > 5 {
+            lines.push(Line::from(Span::styled(
+                if zh {
+                    format!(" … 还有 {} 个", total - 5)
+                } else {
+                    format!(" … {} more", total - 5)
+                },
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
+
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
@@ -371,12 +1283,58 @@ pub fn op_level_meaning(s: &Strings, level: u8) -> &'static str {
     }
 }
 
+/// One-line OP-level legend: `OP 等级  ★1 出生保护豁免 · ★2 作弊指令 · ★3 多人管理 · ★4 服务器管理`.
+/// Compact compared to the prose in `detail_op_level_*`, but uses the same
+/// star glyph as the player rows so the user can connect "row 4 has ★4" to
+/// "★4 = server admin" without leaving the tab.
+fn build_op_legend(lang: Lang) -> Line<'static> {
+    let zh = matches!(lang, Lang::Zh);
+    let pairs: [(&str, &str); 4] = if zh {
+        [
+            ("★1", "出生保护豁免"),
+            ("★2", "作弊指令"),
+            ("★3", "多人管理"),
+            ("★4", "服务器管理"),
+        ]
+    } else {
+        [
+            ("★1", "spawn bypass"),
+            ("★2", "cheat cmds"),
+            ("★3", "player admin"),
+            ("★4", "server admin"),
+        ]
+    };
+    let mut spans: Vec<Span> = vec![
+        Span::raw(" "),
+        Span::styled(
+            if zh { "OP 等级  " } else { "OP levels  " },
+            Style::default().fg(Color::Gray),
+        ),
+    ];
+    for (i, (mark, desc)) in pairs.iter().enumerate() {
+        spans.push(Span::styled(
+            mark.to_string(),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            desc.to_string(),
+            Style::default().fg(Color::Gray),
+        ));
+        if i < pairs.len() - 1 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(Color::Gray)));
+        }
+    }
+    Line::from(spans)
+}
+
 fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
-    // Top single-line legend showing whitelist on/off + how to toggle.
-    // Then list (left) + detail (right) for the rest.
+    // Two-line header: row 1 = online count + whitelist state; row 2 = OP
+    // level legend (always visible so the user doesn't have to memorize what
+    // ★1..4 mean — same info as the detail panel but reachable at a glance).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .constraints([Constraint::Length(2), Constraint::Min(3)])
         .split(area);
 
     let s = app.lang.s();
@@ -388,14 +1346,14 @@ fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
     let legend_color = if app.whitelist_enabled {
         Color::Green
     } else {
-        Color::DarkGray
+        Color::Gray
     };
     let online_count = app.players.iter().filter(|p| p.is_online).count();
     let online_label = match app.lang {
         Lang::En => format!("▶ {} online", online_count),
         Lang::Zh => format!("▶ 在线 {} 人", online_count),
     };
-    let legend = Paragraph::new(Line::from(vec![
+    let row1 = Line::from(vec![
         Span::raw(" "),
         Span::styled(
             online_label,
@@ -403,8 +1361,9 @@ fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
         ),
         Span::raw("    "),
         Span::styled(legend_text, Style::default().fg(legend_color).add_modifier(Modifier::BOLD)),
-    ]));
-    f.render_widget(legend, chunks[0]);
+    ]);
+    let row2 = build_op_legend(app.lang);
+    f.render_widget(Paragraph::new(vec![row1, row2]), chunks[0]);
 
     let (list_area, detail_area) = split_list_detail(chunks[1]);
     let wl_enabled = app.whitelist_enabled;
@@ -412,7 +1371,7 @@ fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = if app.players.is_empty() {
         vec![ListItem::new(Line::from(Span::styled(
             s.players_none,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )))]
     } else {
         app.players
@@ -421,8 +1380,8 @@ fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
             .collect()
     };
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(s.title_players))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::TOP).title(s.title_players))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, list_area, &mut app.players_state);
     if let Some(da) = detail_area {
@@ -459,7 +1418,7 @@ fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> Lis
         if p.in_whitelist {
             Span::styled(" ● ", Style::default().fg(Color::Green))
         } else {
-            Span::styled(" ○ ", Style::default().fg(Color::DarkGray))
+            Span::styled(" ○ ", Style::default().fg(Color::Gray))
         }
     } else {
         Span::raw("   ")
@@ -471,7 +1430,7 @@ fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> Lis
     let (name_color, name_modifier) = if p.is_online {
         (Color::Green, Modifier::BOLD)
     } else if p.historical_only {
-        (Color::DarkGray, Modifier::empty())
+        (Color::Gray, Modifier::empty())
     } else {
         (Color::White, Modifier::empty())
     };
@@ -491,7 +1450,7 @@ fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> Lis
         ),
         Span::styled(
             format!(" {:36} ", &p.uuid),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
     ];
     if let Some(ts) = p.last_denied_at {
@@ -509,11 +1468,16 @@ fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> Lis
 
 fn draw_players_detail(f: &mut Frame, area: Rect, app: &App) {
     let s = app.lang.s();
-    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
+    // Detail panel: TOP separator (with title) + LEFT separator (vertical
+    // line between list and detail). Together they form an "L" that reads as
+    // a clear section divider without a full box.
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::LEFT)
+        .title(s.detail_title);
     let lines: Vec<Line> = match app.players_state.selected().and_then(|i| app.players.get(i)) {
         None => vec![Line::from(Span::styled(
             s.detail_no_selection,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))],
         Some(p) => {
             let yn = |b: bool| if b { s.detail_yes } else { s.detail_no };
@@ -522,7 +1486,7 @@ fn draw_players_detail(f: &mut Frame, area: Rect, app: &App) {
                 Line::raw(""),
                 Line::from(Span::styled(
                     format!("{}:", s.detail_uuid),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 )),
                 Line::from(Span::styled(
                     p.uuid.clone(),
@@ -550,7 +1514,7 @@ fn draw_players_detail(f: &mut Frame, area: Rect, app: &App) {
             out.push(Line::from(Span::styled(
                 s.detail_offline_uuid_note.to_string(),
                 Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(Color::Gray)
                     .add_modifier(Modifier::ITALIC),
             )));
             out
@@ -583,7 +1547,7 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
                     spans.push(Span::raw("    "));
                     spans.push(Span::styled(
                         format!("// {}", annot),
-                        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                        Style::default().fg(Color::Gray).add_modifier(Modifier::ITALIC),
                     ));
                 }
             }
@@ -593,10 +1557,10 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
     let list = List::new(items)
         .block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP)
                 .title(app.lang.s().title_config),
         )
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(list, list_area, &mut app.config_state);
     if let Some(da) = detail_area {
@@ -606,7 +1570,12 @@ fn draw_config(f: &mut Frame, area: Rect, app: &mut App) {
 
 fn draw_config_detail(f: &mut Frame, area: Rect, app: &App) {
     let s = app.lang.s();
-    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
+    // Detail panel: TOP separator (with title) + LEFT separator (vertical
+    // line between list and detail). Together they form an "L" that reads as
+    // a clear section divider without a full box.
+    let block = Block::default()
+        .borders(Borders::TOP | Borders::LEFT)
+        .title(s.detail_title);
     let lines: Vec<Line> = match app
         .config_state
         .selected()
@@ -614,7 +1583,7 @@ fn draw_config_detail(f: &mut Frame, area: Rect, app: &App) {
     {
         None => vec![Line::from(Span::styled(
             s.detail_no_selection,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))],
         Some((k, v)) => {
             let mut out = vec![
@@ -631,7 +1600,7 @@ fn draw_config_detail(f: &mut Frame, area: Rect, app: &App) {
                     out.push(Line::raw(""));
                     out.push(Line::from(Span::styled(
                         format!("{}:", s.detail_description),
-                        Style::default().fg(Color::DarkGray),
+                        Style::default().fg(Color::Gray),
                     )));
                     let desc = match app.lang {
                         Lang::En => m.description_en,
@@ -647,7 +1616,7 @@ fn draw_config_detail(f: &mut Frame, area: Rect, app: &App) {
                     out.push(Line::from(Span::styled(
                         s.detail_no_metadata.to_string(),
                         Style::default()
-                            .fg(Color::DarkGray)
+                            .fg(Color::Gray)
                             .add_modifier(Modifier::ITALIC),
                     )));
                 }
@@ -659,152 +1628,6 @@ fn draw_config_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-fn draw_logs(f: &mut Frame, area: Rect, app: &App) {
-    // Vertical split: 2-line header (watchdog summary) + scrolling body.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(3)])
-        .split(area);
-    draw_logs_watchdog_summary(f, chunks[0], app);
-    draw_logs_body(f, chunks[1], app);
-}
-
-fn draw_logs_watchdog_summary(f: &mut Frame, area: Rect, app: &App) {
-    let summary = match &app.logs_view {
-        LogsView::Server => crate::data::watchdog_summary(&app.server_dir),
-        LogsView::Frpc => crate::data::WatchdogSummary::default(),
-    };
-    let zh = matches!(app.lang, Lang::Zh);
-    let view_label = match (app.logs_view, zh) {
-        (LogsView::Server, true) => "[服务器日志]",
-        (LogsView::Server, false) => "[server log]",
-        (LogsView::Frpc, true) => "[frpc 日志]",
-        (LogsView::Frpc, false) => "[frpc log]",
-    };
-    let toggle_hint = if zh {
-        "f 切到 frpc"
-    } else {
-        "f → frpc"
-    };
-    let mut spans: Vec<Span> = vec![
-        Span::styled(
-            format!(" {} ", view_label),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("({})  ", toggle_hint),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-    // Watchdog counts only meaningful for server view.
-    if matches!(app.logs_view, LogsView::Server) {
-        let lag_color = if summary.tick_lag_count > 0 {
-            Color::Red
-        } else {
-            Color::DarkGray
-        };
-        let gc_color = if summary.long_gc_count > 0 {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
-        spans.push(Span::styled(
-            if zh {
-                format!("近 30 分：⚠ tick lag × {}", summary.tick_lag_count)
-            } else {
-                format!("last 30 min: ⚠ tick lag × {}", summary.tick_lag_count)
-            },
-            Style::default().fg(lag_color).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(
-            if zh {
-                format!("⚠ GC>500ms × {}", summary.long_gc_count)
-            } else {
-                format!("⚠ GC>500ms × {}", summary.long_gc_count)
-            },
-            Style::default().fg(gc_color).add_modifier(Modifier::BOLD),
-        ));
-        if let Some(last_warn) = summary.last_event_label {
-            spans.push(Span::raw("   "));
-            spans.push(Span::styled(
-                if zh {
-                    format!("最近：{}", last_warn)
-                } else {
-                    format!("most recent: {}", last_warn)
-                },
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-    } else {
-        spans.push(Span::styled(
-            if zh {
-                format!("tmux: {}", crate::sys::frpc_tmux_session_name(&app.server_dir))
-            } else {
-                format!("tmux: {}", crate::sys::frpc_tmux_session_name(&app.server_dir))
-            },
-            Style::default().fg(Color::DarkGray),
-        ));
-    }
-    let p = Paragraph::new(Line::from(spans));
-    f.render_widget(p, area);
-}
-
-fn draw_logs_body(f: &mut Frame, area: Rect, app: &App) {
-    let (title, body) = match app.logs_view {
-        LogsView::Server => {
-            let log_path = app.server_dir.join("logs/latest.log");
-            let body = if log_path.exists() {
-                match fs::read_to_string(&log_path) {
-                    Ok(s) => s,
-                    Err(e) => fmt_log_read_error(app.lang, &e.to_string()),
-                }
-            } else {
-                app.lang.s().no_logs_yet.to_string()
-            };
-            (
-                format!("{}{} ", app.lang.s().title_logs_prefix, log_path.display()),
-                body,
-            )
-        }
-        LogsView::Frpc => {
-            let session = crate::sys::frpc_tmux_session_name(&app.server_dir);
-            let body = crate::data::tmux_capture_pane(&session, 1000)
-                .unwrap_or_else(|e| match app.lang {
-                    Lang::En => format!(
-                        "(no frpc session — start it from the Server tab. Detail: {})",
-                        e
-                    ),
-                    Lang::Zh => format!(
-                        "(没有 frpc tmux session — 请到运维 tab 启动。详情：{})",
-                        e
-                    ),
-                });
-            (
-                match app.lang {
-                    Lang::En => format!(" frpc — tmux: {} ", session),
-                    Lang::Zh => format!(" frpc — tmux: {} ", session),
-                },
-                body,
-            )
-        }
-    };
-    // Take only the last `area.height - 2` lines so the view follows tail.
-    let lines: Vec<&str> = body.lines().collect();
-    let take = (area.height as usize).saturating_sub(2).max(1);
-    let start = lines.len().saturating_sub(take);
-    let visible = &lines[start..];
-
-    // Render each line with a per-severity color picked from its content.
-    let rendered: Vec<Line> = visible
-        .iter()
-        .map(|line| Line::from(colorize_log_line(line)))
-        .collect();
-    let p = Paragraph::new(rendered)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
-    f.render_widget(p, area);
-}
 
 /// Colorize one log line based on a substring scan. Cheap (single linear scan)
 /// and good enough — a real log parser would be overkill for tail-mode.
@@ -827,37 +1650,62 @@ pub fn colorize_log_line(line: &str) -> Vec<Span<'static>> {
     vec![Span::styled(line.to_string(), style)]
 }
 
+/// Settings-tab file picker. Shows `server.properties` as a virtual entry at
+/// index 0 (so it always appears even though it isn't in `yaml_files`),
+/// followed by the discovered YAML files. Selecting an entry transitions into
+/// the appropriate editor view (Properties or YAML row editor).
+fn draw_settings_files(f: &mut Frame, area: Rect, app: &mut App) {
+    let zh = matches!(app.lang, Lang::Zh);
+    let title = if zh {
+        " 设置 — 选文件 (Enter 打开) "
+    } else {
+        " Settings — pick file (Enter opens) "
+    };
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(1 + app.yaml_files.len());
+    // Virtual entry 0: server.properties — keyed differently so it stands
+    // out as the canonical settings file.
+    items.push(ListItem::new(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            "server.properties",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if zh { "    (核心配置)" } else { "    (core config)" },
+            Style::default().fg(Color::Gray),
+        ),
+    ])));
+    for p in &app.yaml_files {
+        let display = p
+            .strip_prefix(&app.server_dir)
+            .unwrap_or(p)
+            .display()
+            .to_string();
+        items.push(ListItem::new(Line::from(Span::styled(
+            format!(" {}", display),
+            Style::default().fg(Color::White),
+        ))));
+    }
+
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::TOP).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
+        .highlight_symbol("> ");
+    // Default to entry 0 (server.properties) so a fresh tab visit always has
+    // something selected.
+    if app.yaml_files_state.selected().is_none() {
+        app.yaml_files_state.select(Some(0));
+    }
+    f.render_stateful_widget(list, area, &mut app.yaml_files_state);
+}
+
 fn draw_yaml(f: &mut Frame, area: Rect, app: &mut App) {
     let s = app.lang.s();
     match &app.yaml_view {
-        YamlView::Files => {
-            let items: Vec<ListItem> = if app.yaml_files.is_empty() {
-                vec![ListItem::new(Line::from(Span::styled(
-                    s.yaml_no_files,
-                    Style::default().fg(Color::DarkGray),
-                )))]
-            } else {
-                app.yaml_files
-                    .iter()
-                    .map(|p| {
-                        let display = p
-                            .strip_prefix(&app.server_dir)
-                            .unwrap_or(p)
-                            .display()
-                            .to_string();
-                        ListItem::new(Line::from(Span::styled(
-                            format!(" {}", display),
-                            Style::default().fg(Color::White),
-                        )))
-                    })
-                    .collect()
-            };
-            let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(s.title_yaml_files))
-                .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-                .highlight_symbol("> ");
-            f.render_stateful_widget(list, area, &mut app.yaml_files_state);
-        }
+        // Files / Properties are handled by draw_settings_files / draw_config
+        // before this fn is reached. Treat them as no-op safety nets.
+        YamlView::Files | YamlView::Properties => {}
         YamlView::Editing { file_idx } => {
             let path = app
                 .yaml_files
@@ -879,7 +1727,7 @@ fn draw_yaml(f: &mut Frame, area: Rect, app: &mut App) {
                         YamlDisplay::Branch => {
                             spans.push(Span::styled(
                                 s.yaml_branch_marker,
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(Color::Gray),
                             ));
                         }
                         YamlDisplay::Scalar(v) => {
@@ -896,52 +1744,12 @@ fn draw_yaml(f: &mut Frame, area: Rect, app: &mut App) {
                 })
                 .collect();
             let list = List::new(items)
-                .block(Block::default().borders(Borders::ALL).title(title))
-                .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+                .block(Block::default().borders(Borders::TOP).title(title))
+                .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
                 .highlight_symbol("> ");
             f.render_stateful_widget(list, area, &mut app.yaml_rows_state);
         }
     }
-}
-
-fn draw_backups(f: &mut Frame, area: Rect, app: &mut App) {
-    let s = app.lang.s();
-    let items: Vec<ListItem> = if app.backups.is_empty() {
-        vec![ListItem::new(Line::from(Span::styled(
-            s.backups_none,
-            Style::default().fg(Color::DarkGray),
-        )))]
-    } else {
-        let now = chrono::Local::now();
-        app.backups
-            .iter()
-            .map(|b| {
-                let age = b
-                    .modified
-                    .map(|t| fmt_age(now - t))
-                    .unwrap_or_else(|| "?".into());
-                let when = b
-                    .modified
-                    .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
-                    .unwrap_or_default();
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {:40}", b.name), Style::default().fg(Color::White)),
-                    Span::styled(
-                        format!("{:>10}  ", fmt_bytes(b.size_bytes)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(when, Style::default().fg(Color::DarkGray)),
-                    Span::raw("  "),
-                    Span::styled(age, Style::default().fg(Color::Yellow)),
-                ]))
-            })
-            .collect()
-    };
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(s.title_backups))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut app.backups_state);
 }
 
 pub fn fmt_age(d: chrono::Duration) -> String {
@@ -959,184 +1767,31 @@ pub fn fmt_age(d: chrono::Duration) -> String {
     }
 }
 
-fn draw_server(f: &mut Frame, area: Rect, app: &mut App) {
-    // Vertical split: top = join info (auto-sized to # of interfaces + optional
-    // SakuraFrp row, capped), bottom = actions list.
-    let nics = detect_interfaces();
-    let frp_addr = app.effective_sakurafrp_address();
-    let frp_extra: u16 = if frp_addr.is_some() { 1 } else { 0 };
-    let join_h = (nics.len() as u16 + frp_extra + 2).max(3).min(13); // border(2) + lines
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(join_h), Constraint::Min(3)])
-        .split(area);
-
-    draw_join_info(f, chunks[0], app, &nics);
-    draw_server_actions(f, chunks[1], app);
-}
-
-fn draw_join_info(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
-    use unicode_width::UnicodeWidthStr;
-    let s = app.lang.s();
-    let port: u16 = get_property(&app.properties, "server-port")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(25565);
-
-    let mut lines: Vec<Line> = if nics.is_empty() {
-        vec![Line::from(Span::styled(
-            s.join_no_interfaces,
-            Style::default().fg(Color::DarkGray),
-        ))]
-    } else {
-        nics.iter()
-            .map(|n| {
-                Line::from(vec![
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{:14}", n.name),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("{}:{}", n.ip, port),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw("  "),
-                    Span::styled(
-                        format!("[{}]", nic_kind_label(app.lang, n.kind)),
-                        Style::default().fg(nic_kind_color(n.kind)),
-                    ),
-                ])
-            })
-            .collect()
-    };
-
-    // Optional SakuraFrp row. The user-set address is the literal string they
-    // need to share — already includes port (e.g. `frp-way.com:36192`) because
-    // frp tunnels remap the local 25565 to whatever port the provider
-    // assigned, not server.properties' server-port. Click → wl-copy. The
-    // bracketed kind label also embeds a Docker state marker (●/○/✗/?) so the
-    // user can see at a glance whether the launcher container is up.
-    if let Some(addr) = app.effective_sakurafrp_address() {
-        // v0.15 — marker reflects mc-tui's directly-managed frpc subprocess,
-        // not the docker launcher container. ● when up, ○ when configured
-        // but not running, ✗ when no binary, ? when no token / no tunnels.
-        let (state_marker, state_color) = if app.frpc_pid.is_some() {
-            ("●", Color::Green)
-        } else if app.frpc_binary.is_none() {
-            ("✗", Color::Red)
-        } else if !app.frpc_enabled_ids.is_empty() {
-            ("○", Color::Yellow)
-        } else {
-            ("?", Color::DarkGray)
-        };
-
-        let name_span = Span::styled(
-            format!("{:14}", "frp"),
-            Style::default().fg(Color::White),
-        );
-        let chip_text = addr.clone();
-        let addr_span = Span::styled(
-            chip_text.clone(),
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
-        );
-        let kind_open = Span::styled("[", Style::default().fg(Color::Magenta));
-        let kind_label = Span::styled(s.frp_label, Style::default().fg(Color::Magenta));
-        let kind_marker = Span::styled(format!(" {}", state_marker), Style::default().fg(state_color));
-        let kind_close = Span::styled("]", Style::default().fg(Color::Magenta));
-
-        // Compute chip rect for click-to-copy. Account for the block's 1-char
-        // top border and the leading space + name column.
-        let line_y = area.y + 1 + lines.len() as u16;
-        let prefix_width = 1u16/*border*/ + 1u16/*leading space*/
-            + UnicodeWidthStr::width(name_span.content.as_ref()) as u16
-            + 2u16 /*"  "*/;
-        let chip_rect = Rect {
-            x: area.x + prefix_width,
-            y: line_y,
-            width: UnicodeWidthStr::width(chip_text.as_str()) as u16,
-            height: 1,
-        };
-        if chip_rect.y < area.y + area.height {
-            app.join_chips.push((chip_rect, chip_text));
-        }
-
-        lines.push(Line::from(vec![
-            Span::raw(" "),
-            name_span,
-            Span::raw("  "),
-            addr_span,
-            Span::raw("  "),
-            kind_open,
-            kind_label,
-            kind_marker,
-            kind_close,
-        ]));
-    }
-
-    let p = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(s.join_section_title),
-        )
-        .wrap(Wrap { trim: false });
-    f.render_widget(p, area);
-}
-
-fn draw_server_actions(f: &mut Frame, area: Rect, app: &mut App) {
-    let s = app.lang.s();
-    let items: Vec<ListItem> = SERVER_ACTIONS
-        .iter()
-        .map(|a| {
-            ListItem::new(Line::from(vec![
-                Span::raw(" "),
-                Span::styled(
-                    server_action_label(app.lang, *a),
-                    Style::default().fg(Color::White),
-                ),
-            ]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(s.server_actions_section),
-        )
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, area, &mut app.server_state);
-    // Note: title_server (s.title_server) is intentionally not rendered as a
-    // border title here — Server tab uses two stacked blocks ("Join addresses"
-    // + "Actions") and the tab name in the tab bar already conveys context.
-    let _ = s.title_server;
-}
-
 fn draw_sakurafrp(f: &mut Frame, area: Rect, app: &mut App) {
-    let s = app.lang.s();
-
-    // v0.12 — variable layout:
-    //   * mihomo warning line (0 or 1) — only shown when Sparkle/mihomo is up
-    //   * user panel: 5 lines for the 3-step onboarding when tokenless,
-    //     4 lines once we have a token (so the row layout matches v0.10).
-    //   * tunnel list: takes remaining vertical space.
-    //   * actions hint: 3 lines with the new `o` action surfaced.
+    // v0.16 — Network tab layout:
+    //   * mihomo warning line (0 or 1)
+    //   * user panel (4 or 5 lines based on token state)
+    //   * tunnel list (flex)
+    //   * NIC list — collapsed (0) by default; expand with `n` (varies)
+    //
+    // The 4-line "actions" panel from v0.15.1 is gone — keys live in the
+    // bottom hint row + `?` overlay covers any forgotten ones.
     let mihomo_h: u16 = if app.mihomo_running { 1 } else { 0 };
     let user_h: u16 = if app.natfrp_token.is_none() { 5 } else { 4 };
-
-    // Actions panel needs 4 lines (border + 2 content + slack) since v0.15.1
-    // — too many keys to fit on one row.
-    let actions_h: u16 = 4;
+    let nics = detect_interfaces();
+    let nics_h: u16 = if app.network_show_nics {
+        // 1 header + per-NIC rows + 1 frp row + 1 trailing blank
+        (nics.len() as u16 + 2).min(10)
+    } else {
+        1 // single "n 展开 NIC 列表" hint row
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(mihomo_h),
             Constraint::Length(user_h),
             Constraint::Min(3),
-            Constraint::Length(actions_h),
+            Constraint::Length(nics_h),
         ])
         .split(area);
 
@@ -1145,8 +1800,66 @@ fn draw_sakurafrp(f: &mut Frame, area: Rect, app: &mut App) {
     }
     draw_sakurafrp_user(f, chunks[1], app);
     draw_sakurafrp_tunnels(f, chunks[2], app);
-    draw_sakurafrp_actions_hint(f, chunks[3], app);
-    let _ = s; // referenced through nested fns
+    draw_network_nics(f, chunks[3], app, &nics);
+}
+
+/// Network-tab NIC list. Collapsed by default — single hint line says
+/// "press `n` to expand". When expanded, lists every detected interface +
+/// the frp address marker so the user can pick a non-primary IP for the
+/// rare "friend on a specific VPN" case.
+fn draw_network_nics(f: &mut Frame, area: Rect, app: &mut App, nics: &[NicInfo]) {
+    let zh = matches!(app.lang, Lang::Zh);
+    let port: u16 = get_property(&app.properties, "server-port")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25565);
+
+    if !app.network_show_nics {
+        let p = Paragraph::new(Line::from(vec![
+            Span::styled(
+                if zh {
+                    " ── 网卡 (n 展开) ──────────"
+                } else {
+                    " ── NICs (n to expand) ──────────"
+                },
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+        f.render_widget(p, area);
+        return;
+    }
+
+    let mut lines: Vec<Line> = vec![Line::from(Span::styled(
+        if zh { " ── 网卡 (n 折叠) ──────────" } else { " ── NICs (n to collapse) ──────────" },
+        Style::default().fg(Color::Gray),
+    ))];
+    for n in nics {
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{:14}", n.name), Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled(
+                format!("{}:{}", n.ip, port),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(
+                format!("[{}]", nic_kind_label(app.lang, n.kind)),
+                Style::default().fg(nic_kind_color(n.kind)),
+            ),
+        ]));
+    }
+    if let Some(addr) = app.effective_sakurafrp_address() {
+        lines.push(Line::from(vec![
+            Span::raw("   "),
+            Span::styled(format!("{:14}", "frp"), Style::default().fg(Color::White)),
+            Span::raw("  "),
+            Span::styled(
+                addr,
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), area);
 }
 
 /// One-line dim warning when Sparkle/mihomo is running. Doesn't block anything;
@@ -1155,9 +1868,7 @@ fn draw_sakurafrp_mihomo_warning(f: &mut Frame, area: Rect, app: &App) {
     let s = app.lang.s();
     let p = Paragraph::new(Line::from(Span::styled(
         format!(" {}", s.sf_mihomo_warning),
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::DIM),
+        Style::default().fg(Color::Yellow),
     )));
     f.render_widget(p, area);
 }
@@ -1222,7 +1933,7 @@ fn draw_sakurafrp_user(f: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::styled(
                     format!("{}: {}", s.sf_user_token_label, token_disp),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::Gray),
                 ),
                 Span::raw("   "),
                 Span::styled(
@@ -1244,13 +1955,13 @@ fn draw_sakurafrp_user(f: &mut Frame, area: Rect, app: &App) {
     } else {
         vec![Line::from(Span::styled(
             s.sf_user_loading,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))]
     };
 
     let p = Paragraph::new(lines).block(
         Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP)
             .title(s.title_sakurafrp_user),
     );
     f.render_widget(p, area);
@@ -1264,11 +1975,11 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
     if app.natfrp_token.is_none() {
         let p = Paragraph::new(vec![Line::from(Span::styled(
             format!(" {}", s.sf_user_no_token),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ))])
         .block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP)
                 .title(s.title_sakurafrp_tunnels),
         );
         f.render_widget(p, area);
@@ -1279,11 +1990,11 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
     if app.natfrp_tunnels.is_empty() && !app.natfrp_loaded {
         let p = Paragraph::new(Line::from(Span::styled(
             s.sf_tunnels_loading,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )))
         .block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP)
                 .title(s.title_sakurafrp_tunnels),
         );
         f.render_widget(p, area);
@@ -1299,11 +2010,11 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
     {
         let p = Paragraph::new(Line::from(Span::styled(
             format!(" {}", s.sf_tunnels_loading),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )))
         .block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP)
                 .title(s.title_sakurafrp_tunnels),
         );
         f.render_widget(p, area);
@@ -1317,12 +2028,12 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
         let lines = vec![
             Line::from(Span::styled(
                 format!(" {}", s.sf_tunnels_empty_header),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(Color::Gray),
             )),
             Line::raw(""),
             Line::from(Span::styled(
                 s.sf_tunnels_empty_option_v013,
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                Style::default().fg(Color::Gray),
             )),
             Line::from(Span::styled(
                 s.sf_tunnels_empty_option_browser_a,
@@ -1339,7 +2050,7 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
         ];
         let p = Paragraph::new(lines).block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP)
                 .title(s.title_sakurafrp_tunnels),
         );
         f.render_widget(p, area);
@@ -1355,25 +2066,25 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
         Span::raw("    "),
         Span::styled(
             format!("{:<10}", s.sf_col_id),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
         Span::raw(" "),
         Span::styled(
             format!("{:<18}", s.sf_col_name),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
         Span::raw(" "),
         Span::styled(
             format!("{:<28}", s.sf_col_node),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
         Span::raw(" "),
         Span::styled(
             format!("{:<5}", s.sf_col_type),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         ),
         Span::raw(" "),
-        Span::styled(s.sf_col_address, Style::default().fg(Color::DarkGray)),
+        Span::styled(s.sf_col_address, Style::default().fg(Color::Gray)),
     ]);
 
     let nodes = &app.natfrp_nodes;
@@ -1383,14 +2094,14 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
             let node_label = crate::natfrp::node_label(t.node, nodes);
             let addr = crate::natfrp::public_address(t, nodes).unwrap_or_else(|| "—".to_string());
             let online_marker = if t.online { "●" } else { "○" };
-            let online_color = if t.online { Color::Green } else { Color::DarkGray };
+            let online_color = if t.online { Color::Green } else { Color::Gray };
             // v0.14 — enable/disable marker from launcher state. `?` when the
             // launcher hasn't been reached this session (no docker, no password,
             // TLS failure, …).
             let (enable_marker, enable_color) = match enabled_map.get(&t.id) {
                 Some(true) => ("▶", Color::Green),
                 Some(false) => ("■", Color::Yellow),
-                None => ("?", Color::DarkGray),
+                None => ("?", Color::Gray),
             };
             ListItem::new(Line::from(vec![
                 Span::styled(
@@ -1441,78 +2152,12 @@ fn draw_sakurafrp_tunnels(f: &mut Frame, area: Rect, app: &mut App) {
     let list = List::new(items)
         .block(
             Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP)
                 .title(s.title_sakurafrp_tunnels),
         )
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD))
         .highlight_symbol("");
     f.render_stateful_widget(list, area, &mut shifted);
-}
-
-fn draw_sakurafrp_actions_hint(f: &mut Frame, area: Rect, app: &App) {
-    let s = app.lang.s();
-    // v0.15.1 — two-line layout. Top line is intent-grouped (lifecycle:
-    // setup / enable / disable). Bottom line is everyday navigation
-    // (refresh / token / browser / copy / write ops). The setup verb is
-    // tinted gold + bold so first-time users see it before anything else.
-    let setup_recommended =
-        app.frpc_binary.is_none() || app.frpc_enabled_ids.is_empty();
-
-    let setup_style = if setup_recommended {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-
-    let line_top = Line::from(vec![
-        Span::raw(" "),
-        Span::styled(s.sf_action_setup, setup_style),
-        Span::raw(" (i)   "),
-        Span::styled(s.sf_action_enable, Style::default().fg(Color::White)),
-        Span::raw(" (e)   "),
-        Span::styled(s.sf_action_disable, Style::default().fg(Color::White)),
-        Span::raw(" (x)   "),
-        Span::styled(s.sf_action_create, Style::default().fg(Color::White)),
-        Span::raw(" (c)   "),
-        Span::styled(s.sf_action_migrate, Style::default().fg(Color::White)),
-        Span::raw(" (m)   "),
-        Span::styled(s.sf_action_delete, Style::default().fg(Color::White)),
-        Span::raw(" (d)"),
-    ]);
-
-    let mut line_bot: Vec<Span> = vec![
-        Span::raw(" "),
-        Span::styled(s.sf_action_refresh, Style::default().fg(Color::White)),
-        Span::raw(" (r)   "),
-        Span::styled(s.sf_action_set_token, Style::default().fg(Color::White)),
-        Span::raw(" (t)   "),
-        Span::styled(
-            s.sf_action_open_dashboard,
-            Style::default().fg(Color::White),
-        ),
-        Span::raw(" (o)   "),
-        Span::styled(
-            s.sf_action_copy_address,
-            Style::default().fg(Color::White),
-        ),
-        Span::raw(" (Enter)"),
-    ];
-    if app.launcher_hint_applicable() {
-        line_bot.push(Span::raw("   "));
-        line_bot.push(Span::styled(
-            s.sf_launcher_hint,
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-
-    let p = Paragraph::new(vec![line_top, Line::from(line_bot)]).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(s.title_sakurafrp_actions),
-    );
-    f.render_widget(p, area);
 }
 
 /// Percentage-used for the SakuraFrp traffic plan. Guards against division by
@@ -1534,6 +2179,26 @@ pub fn traffic_color_for(pct: f64) -> Color {
     } else {
         Color::White
     }
+}
+
+/// Strip a backup file's redundant world-name prefix + archive extension so
+/// the inline backup list in Worlds detail is scan-able. `world-20260501.tar.zst`
+/// for world `world` becomes just `20260501`. Pure: tested in unit tests.
+pub fn backup_short_name(filename: &str, world: Option<&str>) -> String {
+    let mut s = filename.to_string();
+    if let Some(w) = world {
+        let prefix = format!("{}-", w);
+        if let Some(rest) = s.strip_prefix(&prefix) {
+            s = rest.to_string();
+        }
+    }
+    for suffix in &[".tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar", ".zip"] {
+        if let Some(rest) = s.strip_suffix(suffix) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    s
 }
 
 /// Truncate `s` to at most `max_cols` display columns (unicode-width aware),
@@ -1558,19 +2223,69 @@ fn truncate_display(s: &str, max_cols: usize) -> String {
 }
 
 fn draw_hints(f: &mut Frame, area: Rect, app: &App) {
+    // 1-line plain footer. Hint only — transient status moved to floating
+    // toast in v0.16 (rendered separately by `draw_toast`).
     let hint = hint_for(app.lang, app.tab, &app.yaml_view);
-    let line = Line::from(vec![
-        Span::styled(format!(" {} ", hint), Style::default().fg(Color::DarkGray)),
-        Span::raw("  │  "),
-        Span::styled(&app.status, Style::default().fg(Color::Yellow)),
-    ]);
-    let p = Paragraph::new(line).block(Block::default().borders(Borders::ALL));
+    let line = Line::from(Span::styled(
+        format!(" {}", hint),
+        Style::default().fg(Color::Gray),
+    ));
+    let p = Paragraph::new(line);
     f.render_widget(p, area);
+}
+
+/// Floating toast in the bottom-right of the content area. Active toast wins;
+/// otherwise legacy `app.status` is rendered as a non-fading Info line so the
+/// pre-toast callsites still surface their messages without each one having
+/// to be migrated. Phase 10 cleanup will retire `app.status` entirely.
+fn draw_toast(f: &mut Frame, content_area: Rect, app: &App) {
+    use unicode_width::UnicodeWidthStr;
+
+    let (msg, kind): (String, ToastKind) = if let Some(t) = app.active_toast() {
+        (t.message.clone(), t.kind)
+    } else if !app.status.is_empty() {
+        (app.status.clone(), crate::classify_status(&app.status))
+    } else {
+        return;
+    };
+
+    let color = match kind {
+        ToastKind::Ok => Color::Green,
+        ToastKind::Info => Color::Cyan,
+        ToastKind::Warn => Color::Yellow,
+        ToastKind::Err => Color::Red,
+    };
+
+    // Render at the very last row of the content area, right-aligned. Single
+    // line; truncate if it doesn't fit. Leave a 1-col right margin so the
+    // text doesn't kiss the screen edge.
+    let max_w = content_area.width.saturating_sub(2) as usize;
+    let display = if UnicodeWidthStr::width(msg.as_str()) > max_w {
+        truncate_display(&msg, max_w)
+    } else {
+        msg.clone()
+    };
+    let w = UnicodeWidthStr::width(display.as_str()) as u16;
+    let y = content_area.y + content_area.height.saturating_sub(1);
+    let x = content_area.x + content_area.width.saturating_sub(w + 1);
+    let toast_rect = Rect {
+        x,
+        y,
+        width: w,
+        height: 1,
+    };
+    let p = Paragraph::new(Span::styled(
+        display,
+        Style::default().fg(color).add_modifier(Modifier::BOLD),
+    ));
+    f.render_widget(ratatui::widgets::Clear, toast_rect);
+    f.render_widget(p, toast_rect);
 }
 
 fn draw_prompt(f: &mut Frame, prompt: &InputPrompt, lang: Lang) {
     let area = centered_rect(60, 5, f.area());
     f.render_widget(ratatui::widgets::Clear, area);
+    // Modal — full border to differentiate from in-tab content.
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" {} ", prompt.title));
@@ -1590,7 +2305,7 @@ fn draw_prompt(f: &mut Frame, prompt: &InputPrompt, lang: Lang) {
         Line::raw(""),
         Line::from(Span::styled(
             lang.s().prompt_confirm_cancel,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )),
     ];
     f.render_widget(Paragraph::new(lines), inner);
@@ -1611,6 +2326,134 @@ fn centered_rect(w_pct: u16, h_lines: u16, area: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LogsLevelFilter;
+
+    #[test]
+    fn is_hms_recognizes_paper_timestamps() {
+        assert!(is_hms("17:59:18"));
+        assert!(is_hms("17:59:18.523")); // longer suffix is fine
+        assert!(!is_hms("17:5918"));
+        assert!(!is_hms("17-59-18"));
+        assert!(!is_hms("foo"));
+    }
+
+    #[test]
+    fn strip_player_action_handles_join_leave_lines() {
+        // The `after` arg is everything after the timestamp's closing `]`.
+        let after = " [Server thread/INFO]: NihilDigit joined the game";
+        assert_eq!(
+            strip_player_action(after, "joined the game").as_deref(),
+            Some("NihilDigit")
+        );
+        assert_eq!(
+            strip_player_action(after, "left the game"),
+            None,
+            "wrong action shouldn't match"
+        );
+        // Empty name is rejected so we don't surface "  joined" rows.
+        let empty = " [Server thread/INFO]:  joined the game";
+        assert_eq!(strip_player_action(empty, "joined the game"), None);
+    }
+
+    #[test]
+    fn extract_name_field_pulls_username_from_disconnect_line() {
+        let line = "[20:00:00] [User Authenticator/INFO]: Disconnecting com.mojang.authlib.GameProfile@xx[id=<...>,name=NihilDigit,properties={},legacy=false] (/192.168.1.1:55555): You are not whitelisted on this server!";
+        assert_eq!(extract_name_field(line).as_deref(), Some("NihilDigit"));
+        // Line without a name= field returns None.
+        assert_eq!(extract_name_field("plain log line"), None);
+    }
+
+    #[test]
+    fn extract_done_duration_grabs_seconds() {
+        let line = "[20:07:18] [Server thread/INFO]: Done (5.996s)! For help, type \"help\"";
+        assert_eq!(extract_done_duration(line).as_deref(), Some("5.996s"));
+        // Server logs always have decimal — but be defensive.
+        assert_eq!(
+            extract_done_duration("[20:07:18] [Server thread/INFO]: Done (12s)! For help").as_deref(),
+            Some("12s")
+        );
+    }
+
+    #[test]
+    fn translate_event_filters_chunk_system_noise() {
+        // The kind of line we DON'T want to surface — it has a timestamp and
+        // looks log-shaped but isn't an event the host cares about.
+        let noise = "[17:59:18] [Server thread/INFO]: [ChunkHolderManager] Halted I/O scheduler for world 'minecraft:overworld'";
+        assert!(translate_event(noise, Lang::En).is_none());
+        // And the kind we DO want.
+        let join = "[17:59:18] [Server thread/INFO]: NihilDigit joined the game";
+        assert!(translate_event(join, Lang::En).is_some());
+        let warn = "[17:59:18] [Server thread/WARN]: Some warning";
+        assert!(translate_event(warn, Lang::En).is_some());
+        let err = "[17:59:18] [Server thread/ERROR]: Boom";
+        assert!(translate_event(err, Lang::En).is_some());
+    }
+
+    #[test]
+    fn translate_event_skips_non_timestamped_lines() {
+        // Wrap-continuation lines (like "'minecraft:the_nether' in 0.00s")
+        // don't have a leading timestamp — drop them.
+        assert!(translate_event("'minecraft:the_nether' in 0.00s", Lang::En).is_none());
+    }
+
+    #[test]
+    fn backup_short_name_strips_world_and_extension() {
+        // World prefix removed when matching, archive extension dropped.
+        assert_eq!(
+            backup_short_name("fuchenling-20260501-180012.tar.zst", Some("fuchenling")),
+            "20260501-180012"
+        );
+        // Different world → only extension stripped.
+        assert_eq!(
+            backup_short_name("world-20260501-180012.tar.zst", Some("fuchenling")),
+            "world-20260501-180012"
+        );
+        // No world hint → leave the name except the extension.
+        assert_eq!(
+            backup_short_name("backup-20260501.tar.gz", None),
+            "backup-20260501"
+        );
+        // Unknown extension → leave intact.
+        assert_eq!(
+            backup_short_name("snap-20260501.dat", Some("snap")),
+            "20260501.dat"
+        );
+    }
+
+    #[test]
+    fn level_filter_passes_everything_when_all() {
+        // ALL filter: every line passes regardless of bracket markers.
+        assert!(line_matches_level("[12:00:00] [Server thread/INFO]: hi", LogsLevelFilter::All));
+        assert!(line_matches_level("[12:00:00] [Server thread/WARN]: hm", LogsLevelFilter::All));
+        assert!(line_matches_level("[12:00:00] [Server thread/ERROR]: !!", LogsLevelFilter::All));
+        assert!(line_matches_level("plain line", LogsLevelFilter::All));
+    }
+
+    #[test]
+    fn level_filter_error_only_lets_errors_through() {
+        assert!(line_matches_level("[12:00] [worker/ERROR]: boom", LogsLevelFilter::Error));
+        assert!(line_matches_level("Found [ERROR] tag", LogsLevelFilter::Error));
+        assert!(!line_matches_level("[12:00] [Server thread/INFO]: hi", LogsLevelFilter::Error));
+        assert!(!line_matches_level("[12:00] [Server thread/WARN]: hm", LogsLevelFilter::Error));
+    }
+
+    #[test]
+    fn level_filter_warn_includes_errors() {
+        // WARN filter: include WARN *and* ERROR (errors are at-least-as-bad).
+        // The user looking for "interesting" output sees both.
+        assert!(line_matches_level("[Server/WARN]: hm", LogsLevelFilter::Warn));
+        assert!(line_matches_level("[Server/ERROR]: !!", LogsLevelFilter::Warn));
+        assert!(!line_matches_level("[Server/INFO]: hi", LogsLevelFilter::Warn));
+    }
+
+    #[test]
+    fn level_filter_info_excludes_warn_and_error() {
+        // INFO filter: hide WARN/ERROR so the user can see just normal flow.
+        assert!(line_matches_level("[Server/INFO]: hi", LogsLevelFilter::Info));
+        assert!(line_matches_level("plain line", LogsLevelFilter::Info));
+        assert!(!line_matches_level("[Server/WARN]: hm", LogsLevelFilter::Info));
+        assert!(!line_matches_level("[Server/ERROR]: !!", LogsLevelFilter::Info));
+    }
 
     #[test]
     fn traffic_pct_handles_zero_total() {
