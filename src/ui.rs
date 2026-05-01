@@ -42,8 +42,7 @@ pub fn ui(f: &mut Frame, app: &mut App) {
     app.list_rect = chunks[2];
     match app.tab {
         TabId::Worlds => draw_worlds(f, chunks[2], app),
-        TabId::Whitelist => draw_whitelist(f, chunks[2], app),
-        TabId::Ops => draw_ops(f, chunks[2], app),
+        TabId::Players => draw_players(f, chunks[2], app),
         TabId::Config => draw_config(f, chunks[2], app),
         TabId::Logs => draw_logs(f, chunks[2], app),
         TabId::Yaml => draw_yaml(f, chunks[2], app),
@@ -251,87 +250,6 @@ fn draw_world_detail(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, area);
 }
 
-fn draw_whitelist(f: &mut Frame, area: Rect, app: &mut App) {
-    let (list_area, detail_area) = split_list_detail(area);
-    let items: Vec<ListItem> = app
-        .whitelist
-        .iter()
-        .map(|e| {
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:20} ", e.name), Style::default().fg(Color::White)),
-                Span::styled(&e.uuid, Style::default().fg(Color::DarkGray)),
-            ]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_whitelist))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, list_area, &mut app.whitelist_state);
-    if let Some(da) = detail_area {
-        draw_whitelist_detail(f, da, app);
-    }
-}
-
-fn draw_whitelist_detail(f: &mut Frame, area: Rect, app: &App) {
-    let s = app.lang.s();
-    let block = Block::default().borders(Borders::ALL).title(s.detail_title);
-    let lines: Vec<Line> = match app
-        .whitelist_state
-        .selected()
-        .and_then(|i| app.whitelist.get(i))
-    {
-        None => vec![Line::from(Span::styled(
-            s.detail_no_selection,
-            Style::default().fg(Color::DarkGray),
-        ))],
-        Some(e) => vec![
-            kv_line_bold(&e.name, Color::Cyan),
-            Line::raw(""),
-            Line::from(Span::styled(
-                format!("{}:", s.detail_uuid),
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                e.uuid.clone(),
-                Style::default().fg(Color::White),
-            )),
-            Line::raw(""),
-            Line::from(Span::styled(
-                s.detail_offline_uuid_note.to_string(),
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )),
-        ],
-    };
-    let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
-    f.render_widget(p, area);
-}
-
-fn draw_ops(f: &mut Frame, area: Rect, app: &mut App) {
-    let (list_area, detail_area) = split_list_detail(area);
-    let items: Vec<ListItem> = app
-        .ops
-        .iter()
-        .map(|e| {
-            ListItem::new(Line::from(vec![
-                Span::styled(format!(" {:20} ", e.name), Style::default().fg(Color::White)),
-                Span::styled(format!("level {} ", e.level), Style::default().fg(Color::Yellow)),
-                Span::styled(&e.uuid, Style::default().fg(Color::DarkGray)),
-            ]))
-        })
-        .collect();
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(app.lang.s().title_ops))
-        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
-        .highlight_symbol("> ");
-    f.render_stateful_widget(list, list_area, &mut app.ops_state);
-    if let Some(da) = detail_area {
-        draw_ops_detail(f, da, app);
-    }
-}
-
 pub fn op_level_meaning(s: &Strings, level: u8) -> &'static str {
     match level {
         1 => s.detail_op_level_1,
@@ -342,32 +260,154 @@ pub fn op_level_meaning(s: &Strings, level: u8) -> &'static str {
     }
 }
 
-fn draw_ops_detail(f: &mut Frame, area: Rect, app: &App) {
+fn draw_players(f: &mut Frame, area: Rect, app: &mut App) {
+    // Top single-line legend showing whitelist on/off + how to toggle.
+    // Then list (left) + detail (right) for the rest.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3)])
+        .split(area);
+
+    let s = app.lang.s();
+    let legend_text = if app.whitelist_enabled {
+        s.players_legend_wl_on
+    } else {
+        s.players_legend_wl_off
+    };
+    let legend_color = if app.whitelist_enabled {
+        Color::Green
+    } else {
+        Color::DarkGray
+    };
+    let legend = Paragraph::new(Line::from(vec![
+        Span::raw(" "),
+        Span::styled(legend_text, Style::default().fg(legend_color).add_modifier(Modifier::BOLD)),
+    ]));
+    f.render_widget(legend, chunks[0]);
+
+    let (list_area, detail_area) = split_list_detail(chunks[1]);
+    let wl_enabled = app.whitelist_enabled;
+
+    let items: Vec<ListItem> = if app.players.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            s.players_none,
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        app.players
+            .iter()
+            .map(|p| player_row(p, wl_enabled, app.lang))
+            .collect()
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(s.title_players))
+        .highlight_style(Style::default().bg(Color::Blue).add_modifier(Modifier::BOLD))
+        .highlight_symbol("> ");
+    f.render_stateful_widget(list, list_area, &mut app.players_state);
+    if let Some(da) = detail_area {
+        draw_players_detail(f, da, app);
+    }
+}
+
+fn player_row(p: &crate::data::PlayerEntry, wl_enabled: bool, lang: Lang) -> ListItem<'static> {
+    let s = lang.s();
+
+    // OP marker: ★n (yellow) when op, "  " (gray dot) when not.
+    let op_span = match p.op_level {
+        Some(level) => Span::styled(
+            format!(" ★{} ", level),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        None => Span::styled("    ", Style::default()),
+    };
+
+    // Whitelist marker: ●/○ when whitelist is enabled; hidden when off.
+    let wl_span = if wl_enabled {
+        if p.in_whitelist {
+            Span::styled(" ● ", Style::default().fg(Color::Green))
+        } else {
+            Span::styled(" ○ ", Style::default().fg(Color::DarkGray))
+        }
+    } else {
+        Span::raw("   ")
+    };
+
+    let name_color = if p.historical_only { Color::DarkGray } else { Color::White };
+    let name_label = if p.historical_only {
+        format!(" {} {} ", p.name, s.players_historical_marker)
+    } else {
+        format!(" {} ", p.name)
+    };
+
+    let mut spans: Vec<Span> = vec![
+        wl_span,
+        op_span,
+        Span::styled(format!("{:24}", truncate_display(&name_label, 24)), Style::default().fg(name_color)),
+        Span::styled(
+            format!(" {:36} ", &p.uuid),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if let Some(ts) = p.last_denied_at {
+        let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0);
+        let date_str = dt
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "?".to_string());
+        spans.push(Span::styled(
+            format!("{} {}", s.players_denied_recently, date_str),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+fn draw_players_detail(f: &mut Frame, area: Rect, app: &App) {
     let s = app.lang.s();
     let block = Block::default().borders(Borders::ALL).title(s.detail_title);
-    let lines: Vec<Line> = match app.ops_state.selected().and_then(|i| app.ops.get(i)) {
+    let lines: Vec<Line> = match app.players_state.selected().and_then(|i| app.players.get(i)) {
         None => vec![Line::from(Span::styled(
             s.detail_no_selection,
             Style::default().fg(Color::DarkGray),
         ))],
-        Some(e) => {
+        Some(p) => {
             let yn = |b: bool| if b { s.detail_yes } else { s.detail_no };
-            vec![
-                kv_line_bold(&e.name, Color::Cyan),
+            let mut out = vec![
+                kv_line_bold(&p.name, Color::Cyan),
                 Line::raw(""),
                 Line::from(Span::styled(
                     format!("{}:", s.detail_uuid),
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(Span::styled(
-                    e.uuid.clone(),
+                    p.uuid.clone(),
                     Style::default().fg(Color::White),
                 )),
                 Line::raw(""),
-                kv_line_label(s.detail_level, &e.level.to_string()),
-                kv_line_label(s.detail_level_meaning, op_level_meaning(s, e.level)),
-                kv_line_label(s.detail_bypass, yn(e.bypasses_player_limit)),
-            ]
+                kv_line_label(s.players_col_wl, yn(p.in_whitelist)),
+            ];
+            match p.op_level {
+                Some(level) => {
+                    out.push(kv_line_label(s.detail_level, &level.to_string()));
+                    out.push(kv_line_label(s.detail_level_meaning, op_level_meaning(s, level)));
+                }
+                None => {
+                    out.push(kv_line_label(s.players_col_op, s.detail_no));
+                }
+            }
+            if let Some(ts) = p.last_denied_at {
+                let date_str = chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "?".into());
+                out.push(kv_line_label(s.players_col_denied, &date_str));
+            }
+            out.push(Line::raw(""));
+            out.push(Line::from(Span::styled(
+                s.detail_offline_uuid_note.to_string(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )));
+            out
         }
     };
     let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });

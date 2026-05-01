@@ -49,8 +49,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabId {
     Worlds,
-    Whitelist,
-    Ops,
+    /// v0.11 — replaces the separate `Whitelist` and `Ops` tabs. Single roster
+    /// view: every name surfaces once, with toggleable whitelist + op flags.
+    Players,
     Config,
     Logs,
     Yaml,
@@ -61,8 +62,7 @@ pub enum TabId {
 
 const TABS: &[(TabId, &str)] = &[
     (TabId::Worlds, "Worlds"),
-    (TabId::Whitelist, "Whitelist"),
-    (TabId::Ops, "Ops"),
+    (TabId::Players, "Players"),
     (TabId::Config, "Config"),
     (TabId::Logs, "Logs"),
     (TabId::Yaml, "YAML"),
@@ -132,7 +132,6 @@ struct InputPrompt {
 #[derive(Debug, Clone)]
 enum PromptAction {
     AddWhitelist,
-    AddOp,
     EditConfig(String),
     NewWorld,
     ChangeServerDir,
@@ -162,8 +161,12 @@ struct App {
 
     pub tab: TabId,
     pub worlds_state: ListState,
-    pub whitelist_state: ListState,
-    pub ops_state: ListState,
+    pub players: Vec<PlayerEntry>,
+    pub players_state: ListState,
+    /// Mirrors `white-list` in `server.properties`. The Players tab top row
+    /// toggles this; when false, the whitelist column is hidden and Enter
+    /// becomes a no-op (op toggles still work).
+    pub whitelist_enabled: bool,
     pub config_state: ListState,
 
     // v0.5 — YAML
@@ -234,8 +237,9 @@ impl App {
             pid: None,
             tab: TabId::Worlds,
             worlds_state: ListState::default(),
-            whitelist_state: ListState::default(),
-            ops_state: ListState::default(),
+            players: Vec::new(),
+            players_state: ListState::default(),
+            whitelist_enabled: false,
             config_state: ListState::default(),
             yaml_files: Vec::new(),
             yaml_files_state: ListState::default(),
@@ -274,11 +278,8 @@ impl App {
         if !app.worlds.is_empty() {
             app.worlds_state.select(Some(0));
         }
-        if !app.whitelist.is_empty() {
-            app.whitelist_state.select(Some(0));
-        }
-        if !app.ops.is_empty() {
-            app.ops_state.select(Some(0));
+        if !app.players.is_empty() {
+            app.players_state.select(Some(0));
         }
         if !app.properties.is_empty() {
             app.config_state.select(Some(0));
@@ -332,13 +333,33 @@ impl App {
         self.yaml_files = list_yaml_files(&self.server_dir);
         self.backups = scan_backups(&self.server_dir);
         self.sakurafrp_docker = detect_sakurafrp_docker(&self.sakurafrp_container);
+        self.whitelist_enabled = get_property(&self.properties, "white-list")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        self.players = scan_players(
+            &self.server_dir,
+            &cur,
+            &self.whitelist,
+            &self.ops,
+        );
+        // Keep selection in range after the merge.
+        if let Some(i) = self.players_state.selected() {
+            if i >= self.players.len() {
+                if self.players.is_empty() {
+                    self.players_state.select(None);
+                } else {
+                    self.players_state.select(Some(self.players.len() - 1));
+                }
+            }
+        } else if !self.players.is_empty() {
+            self.players_state.select(Some(0));
+        }
     }
 
     fn list_state_for(&mut self, tab: TabId) -> &mut ListState {
         match tab {
             TabId::Worlds => &mut self.worlds_state,
-            TabId::Whitelist => &mut self.whitelist_state,
-            TabId::Ops => &mut self.ops_state,
+            TabId::Players => &mut self.players_state,
             TabId::Config => &mut self.config_state,
             TabId::Logs => &mut self.worlds_state,
             TabId::Yaml => match self.yaml_view {
@@ -354,8 +375,7 @@ impl App {
     fn list_len_for(&self, tab: TabId) -> usize {
         match tab {
             TabId::Worlds => self.worlds.len(),
-            TabId::Whitelist => self.whitelist.len(),
-            TabId::Ops => self.ops.len(),
+            TabId::Players => self.players.len(),
             TabId::Config => self.properties.len(),
             TabId::Logs => 0,
             TabId::Yaml => match self.yaml_view {
@@ -564,7 +584,9 @@ impl App {
         Ok(())
     }
 
-    fn remove_whitelist(&mut self) -> Result<()> {
+    /// Remove `name` from `whitelist.json`. Caller decides whether the player
+    /// is or isn't actually present; we silently no-op when they're not.
+    fn remove_from_whitelist_by_name(&mut self, name: &str) -> Result<()> {
         if self.whitelist_corrupt {
             self.status = match self.lang {
                 Lang::En => "✗ whitelist.json is corrupt — fix it before editing.".into(),
@@ -572,17 +594,12 @@ impl App {
             };
             return Ok(());
         }
-        let Some(idx) = self.whitelist_state.selected() else { return Ok(()) };
-        if idx >= self.whitelist.len() {
-            return Ok(());
-        }
-        let removed = self.whitelist.remove(idx);
-        write_whitelist(&self.server_dir, &self.whitelist)?;
-        self.status = fmt_whitelist_removed(self.lang, &removed.name);
-        if self.whitelist.is_empty() {
-            self.whitelist_state.select(None);
-        } else if idx >= self.whitelist.len() {
-            self.whitelist_state.select(Some(self.whitelist.len() - 1));
+        let before = self.whitelist.len();
+        self.whitelist
+            .retain(|e| !e.name.eq_ignore_ascii_case(name));
+        if self.whitelist.len() != before {
+            write_whitelist(&self.server_dir, &self.whitelist)?;
+            self.status = fmt_whitelist_removed(self.lang, name);
         }
         Ok(())
     }
@@ -615,7 +632,7 @@ impl App {
         Ok(())
     }
 
-    fn remove_op(&mut self) -> Result<()> {
+    fn remove_op_by_name(&mut self, name: &str) -> Result<()> {
         if self.ops_corrupt {
             self.status = match self.lang {
                 Lang::En => "✗ ops.json is corrupt — fix it before editing.".into(),
@@ -623,22 +640,16 @@ impl App {
             };
             return Ok(());
         }
-        let Some(idx) = self.ops_state.selected() else { return Ok(()) };
-        if idx >= self.ops.len() {
-            return Ok(());
-        }
-        let removed = self.ops.remove(idx);
-        write_ops(&self.server_dir, &self.ops)?;
-        self.status = fmt_op_removed(self.lang, &removed.name);
-        if self.ops.is_empty() {
-            self.ops_state.select(None);
-        } else if idx >= self.ops.len() {
-            self.ops_state.select(Some(self.ops.len() - 1));
+        let before = self.ops.len();
+        self.ops.retain(|e| !e.name.eq_ignore_ascii_case(name));
+        if self.ops.len() != before {
+            write_ops(&self.server_dir, &self.ops)?;
+            self.status = fmt_op_removed(self.lang, name);
         }
         Ok(())
     }
 
-    fn cycle_op_level(&mut self, dir: i8) -> Result<()> {
+    fn set_op_level_by_name(&mut self, name: &str, level: u8) -> Result<()> {
         if self.ops_corrupt {
             self.status = match self.lang {
                 Lang::En => "✗ ops.json is corrupt — fix it before editing.".into(),
@@ -646,19 +657,117 @@ impl App {
             };
             return Ok(());
         }
-        let Some(idx) = self.ops_state.selected() else { return Ok(()) };
-        if idx >= self.ops.len() {
+        if let Some(o) = self.ops.iter_mut().find(|e| e.name.eq_ignore_ascii_case(name)) {
+            o.level = level;
+            write_ops(&self.server_dir, &self.ops)?;
+            self.status = fmt_op_level_changed(self.lang, name, level);
+        }
+        Ok(())
+    }
+
+    /// v0.11 — Players tab actions, all keyed by `players_state` selection.
+
+    fn selected_player_name(&self) -> Option<String> {
+        let idx = self.players_state.selected()?;
+        Some(self.players.get(idx)?.name.clone())
+    }
+
+    fn toggle_whitelist_for_selected(&mut self) -> Result<()> {
+        if !self.whitelist_enabled {
+            self.status = match self.lang {
+                Lang::En => "✗ Whitelist is disabled — press `w` to enable it.".into(),
+                Lang::Zh => "✗ 白名单未启用 — 按 w 开启。".into(),
+            };
             return Ok(());
         }
-        // Wrap-around 1..=4 (CLAUDE.md says "Level cycles 1–4"): ←/→ at the edges
-        // jumps back to the other end instead of clamping.
-        let cur = self.ops[idx].level as i16;
-        let new = ((cur - 1 + dir as i16).rem_euclid(4) + 1) as u8;
-        self.ops[idx].level = new;
-        write_ops(&self.server_dir, &self.ops)?;
-        let name = self.ops[idx].name.clone();
-        self.status = fmt_op_level_changed(self.lang, &name, new);
+        let Some(name) = self.selected_player_name() else { return Ok(()) };
+        let in_wl = self
+            .whitelist
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(&name));
+        if in_wl {
+            self.remove_from_whitelist_by_name(&name)?;
+        } else {
+            self.add_whitelist(&name)?;
+        }
+        self.refresh_all();
+        self.reselect_player(&name);
         Ok(())
+    }
+
+    fn toggle_op_for_selected(&mut self) -> Result<()> {
+        let Some(name) = self.selected_player_name() else { return Ok(()) };
+        let is_op = self.ops.iter().any(|e| e.name.eq_ignore_ascii_case(&name));
+        if is_op {
+            self.remove_op_by_name(&name)?;
+        } else {
+            self.add_op(&name)?;
+        }
+        self.refresh_all();
+        self.reselect_player(&name);
+        Ok(())
+    }
+
+    fn cycle_op_level_for_selected(&mut self, dir: i8) -> Result<()> {
+        let Some(name) = self.selected_player_name() else { return Ok(()) };
+        let cur = self
+            .ops
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case(&name))
+            .map(|e| e.level as i16);
+        let Some(cur) = cur else {
+            // Not currently op — do nothing rather than silently elevating.
+            self.status = match self.lang {
+                Lang::En => "→ Player is not op (press `o` to op them first).".into(),
+                Lang::Zh => "→ 玩家不是 OP（先按 o 提升）。".into(),
+            };
+            return Ok(());
+        };
+        let new = ((cur - 1 + dir as i16).rem_euclid(4) + 1) as u8;
+        self.set_op_level_by_name(&name, new)?;
+        self.refresh_all();
+        self.reselect_player(&name);
+        Ok(())
+    }
+
+    /// `d` — full purge from whitelist + ops. Useful on the Players tab as a
+    /// single-keystroke "kick this person out of every roster".
+    fn remove_selected_player(&mut self) -> Result<()> {
+        let Some(name) = self.selected_player_name() else { return Ok(()) };
+        self.remove_from_whitelist_by_name(&name)?;
+        self.remove_op_by_name(&name)?;
+        self.refresh_all();
+        self.reselect_player(&name);
+        Ok(())
+    }
+
+    /// `w` — flip `white-list` in `server.properties` and write the file.
+    /// Note: Paper / Purpur honor live changes only after `/whitelist reload`
+    /// or a server restart; we don't push a console command here.
+    fn toggle_whitelist_enabled(&mut self) -> Result<()> {
+        let new = !self.whitelist_enabled;
+        set_property(&mut self.properties, "white-list", if new { "true" } else { "false" });
+        write_properties(&self.server_dir.join("server.properties"), &self.properties)?;
+        self.whitelist_enabled = new;
+        self.status = match (self.lang, new) {
+            (Lang::En, true) => "✓ Whitelist enabled (restart or /whitelist reload to apply).".into(),
+            (Lang::En, false) => "✓ Whitelist disabled (restart or /whitelist reload to apply).".into(),
+            (Lang::Zh, true) => "✓ 已启用白名单（重启或 /whitelist reload 后生效）。".into(),
+            (Lang::Zh, false) => "✓ 已停用白名单（重启或 /whitelist reload 后生效）。".into(),
+        };
+        Ok(())
+    }
+
+    /// After a refresh that may have re-sorted `players`, keep the cursor on
+    /// the row that the user just acted on (by name).
+    fn reselect_player(&mut self, name: &str) {
+        if let Some(i) = self
+            .players
+            .iter()
+            .position(|p| p.name.eq_ignore_ascii_case(name))
+        {
+            self.players_state.select(Some(i));
+        }
     }
 
     // -- v0.5: YAML --
@@ -1282,13 +1391,9 @@ impl App {
         if !self.worlds.is_empty() {
             self.worlds_state.select(Some(0));
         }
-        self.whitelist_state = ListState::default();
-        if !self.whitelist.is_empty() {
-            self.whitelist_state.select(Some(0));
-        }
-        self.ops_state = ListState::default();
-        if !self.ops.is_empty() {
-            self.ops_state.select(Some(0));
+        self.players_state = ListState::default();
+        if !self.players.is_empty() {
+            self.players_state.select(Some(0));
         }
         self.config_state = ListState::default();
         if !self.properties.is_empty() {
@@ -1344,7 +1449,6 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     let value = prompt.buffer.clone();
                     match prompt.action {
                         PromptAction::AddWhitelist => app.add_whitelist(&value)?,
-                        PromptAction::AddOp => app.add_op(&value)?,
                         PromptAction::EditConfig(key) => app.save_config_value(&key, &value)?,
                         PromptAction::NewWorld => app.create_new_world(&value)?,
                         PromptAction::ChangeServerDir => app.change_server_dir(&value)?,
@@ -1396,14 +1500,13 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                 return Ok(());
             }
             KeyCode::Char('1') => app.switch_tab(TabId::Worlds),
-            KeyCode::Char('2') => app.switch_tab(TabId::Whitelist),
-            KeyCode::Char('3') => app.switch_tab(TabId::Ops),
-            KeyCode::Char('4') => app.switch_tab(TabId::Config),
-            KeyCode::Char('5') => app.switch_tab(TabId::Logs),
-            KeyCode::Char('6') => app.switch_tab(TabId::Yaml),
-            KeyCode::Char('7') => app.switch_tab(TabId::Backups),
-            KeyCode::Char('8') => app.switch_tab(TabId::Server),
-            KeyCode::Char('9') => app.switch_tab(TabId::SakuraFrp),
+            KeyCode::Char('2') => app.switch_tab(TabId::Players),
+            KeyCode::Char('3') => app.switch_tab(TabId::Config),
+            KeyCode::Char('4') => app.switch_tab(TabId::Logs),
+            KeyCode::Char('5') => app.switch_tab(TabId::Yaml),
+            KeyCode::Char('6') => app.switch_tab(TabId::Backups),
+            KeyCode::Char('7') => app.switch_tab(TabId::Server),
+            KeyCode::Char('8') => app.switch_tab(TabId::SakuraFrp),
             KeyCode::Tab => app.cycle_tab(1),
             KeyCode::BackTab => app.cycle_tab(-1),
             KeyCode::Char('r') => {
@@ -1472,10 +1575,11 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                     }
                 }
                 TabId::SakuraFrp => app.copy_selected_tunnel_address(),
+                TabId::Players => app.toggle_whitelist_for_selected()?,
                 _ => {}
             },
-            KeyCode::Char('a') => match app.tab {
-                TabId::Whitelist => {
+            KeyCode::Char('a') => {
+                if app.tab == TabId::Players {
                     let s = app.lang.s();
                     app.prompt = Some(InputPrompt {
                         title: s.prompt_title_add_whitelist.into(),
@@ -1484,30 +1588,31 @@ fn run<B: Backend>(terminal: &mut Terminal<B>, app: &mut App) -> Result<()> {
                         action: PromptAction::AddWhitelist,
                     });
                 }
-                TabId::Ops => {
-                    let s = app.lang.s();
-                    app.prompt = Some(InputPrompt {
-                        title: s.prompt_title_op_player.into(),
-                        label: s.prompt_label_player.into(),
-                        buffer: String::new(),
-                        action: PromptAction::AddOp,
-                    });
+            }
+            KeyCode::Char('d') => {
+                if app.tab == TabId::Players {
+                    app.remove_selected_player()?;
                 }
-                _ => {}
-            },
-            KeyCode::Char('d') => match app.tab {
-                TabId::Whitelist => app.remove_whitelist()?,
-                TabId::Ops => app.remove_op()?,
-                _ => {}
-            },
+            }
+            KeyCode::Char('o') => {
+                if app.tab == TabId::Players {
+                    app.toggle_op_for_selected()?;
+                }
+            }
+            KeyCode::Char('w') => {
+                if app.tab == TabId::Players {
+                    app.toggle_whitelist_enabled()?;
+                    app.refresh_all();
+                }
+            }
             KeyCode::Left => {
-                if app.tab == TabId::Ops {
-                    app.cycle_op_level(-1)?;
+                if app.tab == TabId::Players {
+                    app.cycle_op_level_for_selected(-1)?;
                 }
             }
             KeyCode::Right => {
-                if app.tab == TabId::Ops {
-                    app.cycle_op_level(1)?;
+                if app.tab == TabId::Players {
+                    app.cycle_op_level_for_selected(1)?;
                 }
             }
             // v0.2 new keys
@@ -1793,8 +1898,7 @@ fn render_screenshot(
     let mut app = App::new_with_lang(server_dir.to_path_buf(), lang)?;
     app.tab = match tab.to_ascii_lowercase().as_str() {
         "worlds" => TabId::Worlds,
-        "whitelist" => TabId::Whitelist,
-        "ops" => TabId::Ops,
+        "players" | "whitelist" | "ops" => TabId::Players,
         "config" => TabId::Config,
         "logs" => TabId::Logs,
         "yaml" => TabId::Yaml,
@@ -2467,6 +2571,91 @@ players:
         assert!(!rect_contains(r, 9, 20));
         assert!(!rect_contains(r, 40, 20));
         assert!(!rect_contains(r, 10, 25));
+    }
+
+    #[test]
+    fn scans_uuid_of_player_lines() {
+        let lines = vec![
+            "[00:05:59] [User Authenticator #3/INFO]: UUID of player Urisaki is 43b6b1f9-4219-3f2c-a702-036847c8b8cc".to_string(),
+            "garbage line".to_string(),
+            "[00:06:00] [User Authenticator #4/INFO]: UUID of player AlphaGuy is aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+        ];
+        let mut acc = LogScanResult::default();
+        scan_lines(&lines, 1_000_000, &mut acc);
+        assert_eq!(acc.uuid_by_name.get("Urisaki").map(|s| s.as_str()), Some("43b6b1f9-4219-3f2c-a702-036847c8b8cc"));
+        assert_eq!(acc.uuid_by_name.get("AlphaGuy").map(|s| s.as_str()), Some("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+    }
+
+    #[test]
+    fn scans_denied_login_lines() {
+        let lines = vec![
+            "[23:50:15] [Server thread/INFO]: Disconnecting Urisaki (/10.24.0.123:12463): You are not whitelisted on this server!".to_string(),
+            "[23:51:02] [Server thread/INFO]: Added Urisaki to the whitelist".to_string(),
+        ];
+        let mut acc = LogScanResult::default();
+        scan_lines(&lines, 1_700_000_000, &mut acc);
+        assert_eq!(acc.last_denied_by_name.get("Urisaki").copied(), Some(1_700_000_000));
+    }
+
+    #[test]
+    fn denied_logins_keep_latest_date() {
+        let lines = vec![
+            "[20:00:00] [Server thread/INFO]: Disconnecting Urisaki (/x): You are not whitelisted on this server!".to_string(),
+        ];
+        let mut acc = LogScanResult::default();
+        scan_lines(&lines, 1_700_000_000, &mut acc);
+        scan_lines(&lines, 1_700_086_400, &mut acc); // newer date
+        scan_lines(&lines, 1_699_900_000, &mut acc); // older date — must NOT overwrite
+        assert_eq!(acc.last_denied_by_name.get("Urisaki").copied(), Some(1_700_086_400));
+    }
+
+    #[test]
+    fn scan_log_corpus_handles_gz() {
+        use flate2::Compression;
+        use flate2::write::GzEncoder;
+        use std::io::Write;
+        let dir = tempdir();
+        let logs = dir.join("logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        // Plain latest.log
+        std::fs::write(
+            logs.join("latest.log"),
+            b"[00:00:00] [Server thread/INFO]: Disconnecting Bob (/1.2.3.4:5): You are not whitelisted on this server!\n",
+        ).unwrap();
+        // Rotated YYYY-MM-DD-N.log.gz
+        let raw = b"[00:00:00] [User Authenticator #1/INFO]: UUID of player Carol is 11111111-2222-3333-4444-555555555555\n";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(raw).unwrap();
+        let gz = enc.finish().unwrap();
+        std::fs::write(logs.join("2026-04-30-1.log.gz"), gz).unwrap();
+        // server.properties so dir looks like a server-dir
+        std::fs::write(dir.join("server.properties"), b"").unwrap();
+
+        let res = scan_log_corpus(&dir);
+        assert!(res.last_denied_by_name.contains_key("Bob"));
+        assert_eq!(
+            res.uuid_by_name.get("Carol").map(|s| s.as_str()),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn scan_players_merges_and_sorts() {
+        let dir = tempdir();
+        std::fs::write(dir.join("server.properties"), b"").unwrap();
+        let wl = vec![WhitelistEntry { uuid: "u1".into(), name: "Alice".into() }];
+        let ops = vec![OpEntry { uuid: "u2".into(), name: "Bob".into(), level: 4, bypasses_player_limit: false }];
+        // No log dir → no log entries.
+        let players = scan_players(&dir, "world", &wl, &ops);
+        // Expect: Bob (op, bucket 1) before Alice (whitelist-only, bucket 2)
+        let names: Vec<_> = players.iter().map(|p| p.name.clone()).collect();
+        assert_eq!(names, vec!["Bob".to_string(), "Alice".to_string()]);
+        let bob = &players[0];
+        assert_eq!(bob.op_level, Some(4));
+        assert!(!bob.in_whitelist);
+        let alice = &players[1];
+        assert!(alice.in_whitelist);
+        assert!(alice.op_level.is_none());
     }
 
     #[test]

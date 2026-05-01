@@ -229,6 +229,320 @@ pub fn write_ops(server_dir: &Path, entries: &[OpEntry]) -> Result<()> {
     Ok(())
 }
 
+// ---------- Players (merged whitelist + ops + denied logins) ----------
+//
+// v0.11 collapses the separate Whitelist and Ops tabs into one "Players" view.
+// Sources of truth, ordered from most-active to most-historical:
+//
+// 1. `whitelist.json` — currently allowed names + their UUIDs.
+// 2. `ops.json` — currently elevated names + level (1..4).
+// 3. `world/<level>/playerdata/*.dat` — every player who has ever logged in.
+//    Only their UUID is on disk, so the name-mapping comes from logs.
+// 4. `logs/latest.log` + `logs/YYYY-MM-DD-N.log.gz` — login attempts. Two
+//    line shapes are mined:
+//      a. `UUID of player <name> is <uuid>` → name↔uuid mapping for anyone
+//         who has tried to connect, regardless of outcome.
+//      b. `Disconnecting <name> (...): You are not whitelisted on this server!`
+//         → denied login attempts. The name + the date implied by the log
+//         filename go into `denied_at`.
+//
+// The merged view lets the user see "people who tried to join but were
+// rejected" alongside the actual roster, so admitting a friend is one toggle
+// instead of asking them to re-join after a `/whitelist add`.
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlayerEntry {
+    pub name: String,
+    pub uuid: String,
+    pub in_whitelist: bool,
+    /// `Some(level)` when the player is in `ops.json`; `None` otherwise.
+    /// Levels are 1..=4 in vanilla — we keep whatever value the file has.
+    pub op_level: Option<u8>,
+    /// `Some(unix_seconds_at_log_date)` for the most recent denied login we
+    /// could find in the log corpus. Granularity is one day (log filenames
+    /// give us the date but parsing the per-entry HH:MM:SS into a real
+    /// timestamp would require the log's TZ, which Paper doesn't record).
+    pub last_denied_at: Option<i64>,
+    /// True when we only know about this player from the playerdata folder
+    /// (no whitelist, no ops, no denied attempts in the recent log corpus).
+    /// Lower-priority for sort.
+    pub historical_only: bool,
+}
+
+/// Build the merged `PlayerEntry` list. Caller passes already-loaded
+/// whitelist + ops to avoid re-reading them; the world's `playerdata/` and
+/// the log corpus get scanned every call.
+pub fn scan_players(
+    server_dir: &Path,
+    level_name: &str,
+    whitelist: &[WhitelistEntry],
+    ops: &[OpEntry],
+) -> Vec<PlayerEntry> {
+    use std::collections::BTreeMap;
+
+    // Fold-in by lowercase-name to dedupe across sources. Keeping the
+    // first-seen casing as the display name is fine — Minecraft names are
+    // case-insensitive at the protocol level.
+    let mut by_name: BTreeMap<String, PlayerEntry> = BTreeMap::new();
+    let key = |s: &str| s.to_ascii_lowercase();
+
+    for w in whitelist {
+        by_name.insert(
+            key(&w.name),
+            PlayerEntry {
+                name: w.name.clone(),
+                uuid: w.uuid.clone(),
+                in_whitelist: true,
+                op_level: None,
+                last_denied_at: None,
+                historical_only: false,
+            },
+        );
+    }
+    for o in ops {
+        by_name
+            .entry(key(&o.name))
+            .and_modify(|p| {
+                p.op_level = Some(o.level);
+                if p.uuid.is_empty() {
+                    p.uuid = o.uuid.clone();
+                }
+            })
+            .or_insert_with(|| PlayerEntry {
+                name: o.name.clone(),
+                uuid: o.uuid.clone(),
+                in_whitelist: false,
+                op_level: Some(o.level),
+                last_denied_at: None,
+                historical_only: false,
+            });
+    }
+
+    let scan = scan_log_corpus(server_dir);
+    for (name, uuid) in &scan.uuid_by_name {
+        by_name
+            .entry(key(name))
+            .and_modify(|p| {
+                if p.uuid.is_empty() {
+                    p.uuid = uuid.clone();
+                }
+            })
+            .or_insert_with(|| PlayerEntry {
+                name: name.clone(),
+                uuid: uuid.clone(),
+                in_whitelist: false,
+                op_level: None,
+                last_denied_at: None,
+                // We could actually be a returning regular — disambiguated by
+                // the next loop overwriting `last_denied_at` if applicable.
+                historical_only: true,
+            });
+    }
+    for (name, ts) in &scan.last_denied_by_name {
+        by_name
+            .entry(key(name))
+            .and_modify(|p| {
+                p.last_denied_at = Some(*ts);
+                p.historical_only = false;
+            })
+            .or_insert_with(|| PlayerEntry {
+                name: name.clone(),
+                uuid: offline_uuid(name),
+                in_whitelist: false,
+                op_level: None,
+                last_denied_at: Some(*ts),
+                historical_only: false,
+            });
+    }
+
+    // Pull names off of playerdata/*.dat — UUIDs only, but it tells us
+    // someone has joined before. We can't infer the name here without a NBT
+    // parser, so we just count on log scan to have populated the mapping.
+    let pd = server_dir.join(level_name).join("playerdata");
+    if let Ok(rd) = fs::read_dir(&pd) {
+        for entry in rd.filter_map(|e| e.ok()) {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("dat") {
+                continue;
+            }
+            let Some(uuid) = p.file_stem().and_then(|s| s.to_str()) else { continue };
+            // If we already know this UUID under some name, leave it. Else
+            // synthesize a placeholder entry keyed by the UUID itself.
+            let known = by_name.values().any(|p| p.uuid == uuid);
+            if !known {
+                by_name.insert(
+                    format!("uuid:{}", uuid),
+                    PlayerEntry {
+                        name: format!("(uuid:{}…)", &uuid[..8.min(uuid.len())]),
+                        uuid: uuid.to_string(),
+                        in_whitelist: false,
+                        op_level: None,
+                        last_denied_at: None,
+                        historical_only: true,
+                    },
+                );
+            }
+        }
+    }
+
+    // Sort: denied-recently first, then op, then whitelist-only, then
+    // historical. Within each band, lex by name.
+    let mut out: Vec<PlayerEntry> = by_name.into_values().collect();
+    out.sort_by(|a, b| {
+        // Bucket: 0 = recently denied, 1 = op, 2 = whitelist, 3 = historical.
+        let bucket = |p: &PlayerEntry| {
+            if p.last_denied_at.is_some() && !p.in_whitelist && p.op_level.is_none() {
+                0
+            } else if p.op_level.is_some() {
+                1
+            } else if p.in_whitelist {
+                2
+            } else {
+                3
+            }
+        };
+        bucket(a)
+            .cmp(&bucket(b))
+            .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+    });
+    out
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LogScanResult {
+    /// Display name → UUID, harvested from `UUID of player NAME is UUID` lines.
+    pub uuid_by_name: std::collections::HashMap<String, String>,
+    /// Display name → last unix-seconds (00:00 UTC of the log's date) where
+    /// the player got denied for "not whitelisted".
+    pub last_denied_by_name: std::collections::HashMap<String, i64>,
+}
+
+pub fn scan_log_corpus(server_dir: &Path) -> LogScanResult {
+    let logs_dir = server_dir.join("logs");
+    let mut acc = LogScanResult::default();
+    let Ok(rd) = fs::read_dir(&logs_dir) else { return acc };
+
+    // Collect all candidate log files. We process them in date order so the
+    // last_denied_by_name gets overwritten by the latest occurrence.
+    let mut files: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { return false };
+            name == "latest.log" || name.ends_with(".log") || name.ends_with(".log.gz")
+        })
+        .collect();
+    // latest.log is for "today"; sort it last so its entries take precedence.
+    files.sort_by_key(|p| {
+        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("").to_string();
+        // Tuple sort: (is_latest, name) — false (rotated) first, true (latest) last.
+        let is_latest = name == "latest.log";
+        (is_latest, name)
+    });
+
+    for path in files {
+        let Some(date_ts) = log_file_date_unix(&path) else { continue };
+        let lines = read_log_lines(&path);
+        scan_lines(&lines, date_ts, &mut acc);
+    }
+    acc
+}
+
+/// Today's midnight UTC for `latest.log`; the date encoded in
+/// `YYYY-MM-DD-N.log.gz` for rotated files.
+fn log_file_date_unix(path: &Path) -> Option<i64> {
+    let name = path.file_name()?.to_str()?;
+    if name == "latest.log" {
+        // Use the file's mtime as a proxy for "today" — keeps the test
+        // surface simple and is consistent with what the user would see
+        // tailing the file by hand.
+        let meta = fs::metadata(path).ok()?;
+        let modified = meta.modified().ok()?;
+        let secs = modified
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_secs() as i64;
+        return Some(secs);
+    }
+    // YYYY-MM-DD-N.log[.gz]
+    let trimmed = name
+        .strip_suffix(".log.gz")
+        .or_else(|| name.strip_suffix(".log"))?;
+    let parts: Vec<&str> = trimmed.split('-').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    let y: i32 = parts[0].parse().ok()?;
+    let m: u32 = parts[1].parse().ok()?;
+    let d: u32 = parts[2].parse().ok()?;
+    use chrono::TimeZone;
+    let dt = chrono::Utc.with_ymd_and_hms(y, m, d, 0, 0, 0).single()?;
+    Some(dt.timestamp())
+}
+
+fn read_log_lines(path: &Path) -> Vec<String> {
+    use std::io::{BufRead, BufReader};
+    let Ok(file) = fs::File::open(path) else { return Vec::new() };
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    if name.ends_with(".gz") {
+        let r = BufReader::new(flate2::read::GzDecoder::new(file));
+        r.lines().map_while(|l| l.ok()).collect()
+    } else {
+        let r = BufReader::new(file);
+        r.lines().map_while(|l| l.ok()).collect()
+    }
+}
+
+pub fn scan_lines(lines: &[String], date_ts: i64, out: &mut LogScanResult) {
+    for line in lines {
+        // Pattern A: "UUID of player NAME is UUID"
+        if let Some(name_uuid) = parse_uuid_of_player(line) {
+            out.uuid_by_name.insert(name_uuid.0, name_uuid.1);
+            continue;
+        }
+        // Pattern B: "Disconnecting NAME (..): You are not whitelisted on this server!"
+        if line.contains("not whitelisted on this server") {
+            if let Some(name) = parse_disconnect_name(line) {
+                // Only overwrite when this date is newer than what we have.
+                let entry = out.last_denied_by_name.entry(name).or_insert(date_ts);
+                if date_ts > *entry {
+                    *entry = date_ts;
+                }
+            }
+        }
+    }
+}
+
+/// `[HH:MM:SS] [User Authenticator #N/INFO]: UUID of player NAME is UUID`
+fn parse_uuid_of_player(line: &str) -> Option<(String, String)> {
+    let idx = line.find("UUID of player ")?;
+    let rest = &line[idx + "UUID of player ".len()..];
+    // Up to the next " is "
+    let is_idx = rest.find(" is ")?;
+    let name = rest[..is_idx].trim().to_string();
+    let after_is = &rest[is_idx + " is ".len()..];
+    // UUID token is whitespace-separated, take first 36 chars.
+    let token: String = after_is.chars().take(36).collect();
+    if name.is_empty() || token.len() != 36 {
+        return None;
+    }
+    Some((name, token))
+}
+
+/// `[HH:MM:SS] [Server thread/INFO]: Disconnecting NAME (...): You are not whitelisted on this server!`
+fn parse_disconnect_name(line: &str) -> Option<String> {
+    let idx = line.find("Disconnecting ")?;
+    let rest = &line[idx + "Disconnecting ".len()..];
+    // Name ends at first space or '(' — both possible depending on whether
+    // there's a parenthesized address ("Disconnecting NAME (/ip:port): ...").
+    let end = rest.find(|c: char| c == ' ' || c == '(').unwrap_or(rest.len());
+    let name = rest[..end].trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
+}
+
 /// Find the Java process running the Paper/Purpur/Spigot server in `server_dir`.
 ///
 /// Why sticky: a single process scan can miss `cwd` for a process that's mid-fork,

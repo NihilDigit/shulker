@@ -21,6 +21,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 unicode-width = "0.2"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [profile.release]
 lto = "thin"

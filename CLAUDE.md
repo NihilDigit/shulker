@@ -9,13 +9,13 @@ A small TUI (terminal UI) manager for a local Minecraft Paper / Purpur server.
 Manages the boring parts of running a friend-group Minecraft server without leaving the terminal. Eight tabs:
 
 - **1 Worlds** — list every world directory under your server dir, see which is current, switch the active level by writing `level-name`. `N` creates a new world (writes the new name; the server generates the dir on next start).
-- **2 Whitelist** — add / remove players. Offline-mode UUID is computed automatically (`md5("OfflinePlayer:" + name)`).
-- **3 Ops** — add / remove ops, cycle permission level 1–4 with `←` / `→`. Detail panel explains what each level allows.
-- **4 Config** — browse `server.properties`, edit any value with `Enter`. In Chinese mode each row shows a 中文 annotation; the right-side detail panel shows default + range + restart-required + bilingual description.
-- **5 Logs** — tail `logs/latest.log`.
-- **6 YAML** — pick a Paper/Purpur YAML (`paper-global.yml`, `purpur.yml`, etc.), enter the file, navigate the flattened tree, edit leaf scalars in place.
-- **7 Backups** — list archives in `<server-dir>/backups`, `../backups`, `../mc-backups`, `../<name>-backups`. Newest-first with size + age columns.
-- **8 Server (运维)** — restart now, run `backup.sh`, schedule a daily restart / backup as a `systemd --user` timer, pre-generate chunks via `tmux send-keys` to the server console (`chunky` plugin), show the `tmux attach` command. The top of this tab also lists every IPv4 interface (ZeroTier first).
+- **2 Players** — unified roster merged from `whitelist.json`, `ops.json`, `world/playerdata/*.dat`, and the rolling log corpus (`logs/latest.log` + `logs/*.log.gz`). Toggle whitelist with Enter, op state with `o`, op level 1–4 with `←/→`, purge with `d`, add a new name with `a`. `w` flips the `white-list` setting in `server.properties` (whitelist column hides while disabled). Names that got rejected with "not whitelisted" surface a `denied YYYY-MM-DD` marker so admitting a friend is one keystroke.
+- **3 Config** — browse `server.properties`, edit any value with `Enter`. In Chinese mode each row shows a 中文 annotation; the right-side detail panel shows default + range + restart-required + bilingual description.
+- **4 Logs** — tail `logs/latest.log`.
+- **5 YAML** — pick a Paper/Purpur YAML (`paper-global.yml`, `purpur.yml`, etc.), enter the file, navigate the flattened tree, edit leaf scalars in place.
+- **6 Backups** — list archives in `<server-dir>/backups`, `../backups`, `../mc-backups`, `../<name>-backups`. Newest-first with size + age columns.
+- **7 Server (运维)** — restart now, run `backup.sh`, schedule a daily restart / backup as a `systemd --user` timer, pre-generate chunks via `tmux send-keys` to the server console (`chunky` plugin), show the `tmux attach` command. The top of this tab also lists every IPv4 interface.
+- **8 SakuraFrp** — pull the user's account header + tunnel list directly from `api.natfrp.com/v4`. Enter on a row copies the public address; `t` opens the token prompt; `r` re-fetches.
 
 Plus an always-visible **join address bar** between the status row and the tab bar — click the chip to copy `<ip>:<port>` to the clipboard via `wl-copy`.
 
@@ -81,20 +81,23 @@ mc-tui screenshot --tab worlds --lang zh --width 130 --height 32
 
 | Key | Action |
 |---|---|
-| `1` … `9` | Jump to tab |
+| `1` … `8` | Jump to tab |
 | `Tab` / `Shift+Tab` | Cycle tabs |
 | `↑` / `↓` | Move selection |
-| `Enter` | Switch world / Edit config or YAML value / Run server action / Open YAML file |
+| `Enter` | Switch world / Toggle whitelist (Players) / Edit config or YAML / Run server action / Copy SakuraFrp address |
 | `Esc` | Cancel prompt; in YAML edit view, return to file picker |
-| `a` | Add (whitelist / op) |
-| `d` | Delete (whitelist / op) |
-| `←` / `→` | Cycle op level (Ops tab — wraps 1↔4) |
+| `a` | Add player (Players tab — opens whitelist-add prompt) |
+| `d` | Purge player from whitelist + ops (Players tab) |
+| `o` | Toggle op for selected player (Players tab) |
+| `←` / `→` | Cycle op level for selected player (Players tab — wraps 1↔4) |
+| `w` | Toggle `white-list` setting (Players tab) |
+| `t` | Set SakuraFrp API token (SakuraFrp tab) |
 | `N` | New world (Worlds tab) |
 | `S` | Start server (spawns `start.sh` in a detached tmux session) |
 | `X` | Stop server (sends `stop` to the tmux console) |
 | `D` | Switch `--server-dir` at runtime |
 | `L` | Toggle 中 / EN |
-| `r` | Refresh from disk |
+| `r` | Refresh from disk (and from SakuraFrp API on tab 8) |
 | `q` / `Esc` | Quit |
 | Mouse | Click tab bar, list rows, or the join chip (chip → wl-copy) |
 
@@ -104,8 +107,10 @@ When a prompt is open: type the value, `Enter` to confirm, `Esc` to cancel.
 
 - **Worlds tab — switching**: refuses while server is running. Writes `level-name=<chosen>` to `server.properties`. **Drops comments** in `server.properties` (Java properties is quirky and round-tripping comments isn't worth the complexity). Key/value order is preserved.
 - **Worlds tab — N (new)**: refuses while server is running. Validates the name (no `/`, `\`, `.`, `..`). Writes `level-name=<name>` only — the world directory + `level.dat` are generated on next server start. The list shows a placeholder entry for the pending world so you can see the state took.
-- **Whitelist tab — add/remove**: rewrites `whitelist.json` as pretty-printed JSON. UUID for new entries is the offline UUID. **Refuses to write if `whitelist.json` failed to parse on read** (would clobber user's broken-but-recoverable file).
-- **Ops tab — add/remove/level**: rewrites `ops.json`. New ops default to level 4, `bypassesPlayerLimit=false`. Level cycles 1↔4 (←/→ wrap). Same corruption-guard as whitelist.
+- **Players tab — toggle whitelist (Enter)**: rewrites `whitelist.json` as pretty-printed JSON. UUID for new entries is the offline UUID (Java/Paper offline mode). No-op when `white-list` is disabled in `server.properties`. **Refuses to write if `whitelist.json` failed to parse on read** (would clobber user's broken-but-recoverable file). Same guard for `ops.json`.
+- **Players tab — toggle op (`o`)**: rewrites `ops.json`. New ops default to level 4, `bypassesPlayerLimit=false`. `←/→` cycles the level 1↔4 (wraps). `d` purges the selected player from both `whitelist.json` and `ops.json` in one shot.
+- **Players tab — `w`**: writes `white-list=true|false` into `server.properties`. mc-tui does **not** push a `/whitelist reload` to the running server; the change applies on next restart or after a manual reload.
+- **Players tab — name discovery**: `whitelist.json` ∪ `ops.json` ∪ `world/<level>/playerdata/*.dat` (UUIDs) ∪ all `logs/latest.log` and `logs/YYYY-MM-DD-N.log.gz`. The log scan harvests `UUID of player NAME is UUID` lines (name↔UUID mapping) and `Disconnecting NAME (...): You are not whitelisted on this server!` lines (denied attempts, dated by the log filename).
 - **Config tab — edit**: same `server.properties` write path as Worlds.
 - **Logs tab — read-only**: tails `logs/latest.log`.
 - **YAML tab — edit leaf**: full read → mutate `serde_yaml::Value` → write the file. Keeps key order. Preserves nested structure.
@@ -146,7 +151,7 @@ Module dependency rule: **ui ← app/main ← {i18n, data, sys, cli}**. UI reads
 
 ```bash
 cargo run -- --server-dir /path/to/your/server
-cargo test       # 55 unit tests across all modules
+cargo test       # 60 unit tests across all modules
 cargo build --release
 ```
 
